@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>結帳</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="topbar"><a href="/">← 商品列表</a><span class="sub">Checkout Demo</span><a class="nav" href="/admin.html" target="_blank" rel="noopener">Demo 後台 ↗</a></div>
+
+<div class="container">
+  <div id="load-error" class="errors hidden"></div>
+
+  <div id="checkout" class="checkout hidden">
+    <!-- ================= left: product + summary ================= -->
+    <aside>
+      <div class="panel">
+        <div class="items-head"><b>購買商品</b><a href="/">＋ 繼續選購</a></div>
+        <div id="items"></div>
+        <div class="features">
+          <div>可選擇加購商品</div>
+          <div>臺灣本島免運、可寄離島</div>
+          <div>可寄送至 美國、澳洲、日本 等地區</div>
+          <div>信用卡享 6 期零利率</div>
+        </div>
+      </div>
+
+      <div class="summary">
+        <div class="line"><span>使用 折扣碼</span>
+          <div class="coupon">
+            <input type="text" id="coupon-input" placeholder="例：RETURN500" autocomplete="off">
+            <button type="button" class="btn btn-ghost btn-small" id="coupon-apply">套用</button>
+          </div>
+        </div>
+        <div class="coupon-msg" id="coupon-msg"></div>
+        <div class="line"><span>商品金額</span><span class="money" id="s-main"></span></div>
+        <div class="line sub"><span>加購選項</span><span class="money" id="s-addon"></span></div>
+        <div class="line"><span id="s-ship-label">運費</span><span class="money" id="s-ship"></span></div>
+        <div class="line sub hidden" id="s-donation-row"><span>加碼贊助</span><span class="money" id="s-donation"></span></div>
+        <div class="line hidden" id="s-discount-row"><span>折扣</span><span class="money danger" id="s-discount"></span></div>
+        <div class="line total"><span>總金額</span><span class="money" id="s-total"></span></div>
+      </div>
+    </aside>
+
+    <!-- ================= right: form ================= -->
+    <form id="form" class="panel" novalidate>
+      <div class="section-title">加購商品（選填）</div>
+      <div id="addons"></div>
+
+      <div class="section-title">付款方式</div>
+      <div id="payment-methods"></div>
+      <div class="notice">• 您了解您的贊助是支持創意專案的一種方式，也了解創意實踐過程中充滿變數，專案不一定能確保回饋。</div>
+
+      <label class="field">加碼贊助（選填）</label>
+      <div class="prefix-input"><span>NT$</span><input type="number" id="donation" min="0" step="1" value="0"></div>
+
+      <label class="field">收件地點</label>
+      <select id="region"></select>
+
+      <div id="tw-fields" class="grid-2">
+        <div><label class="field">縣市</label><select id="county"></select></div>
+        <div><label class="field">鄉鎮市區</label><select id="district"></select></div>
+      </div>
+
+      <div class="grid-addr">
+        <div><label class="field">地址</label><input type="text" id="address" placeholder="路名、門牌、樓層"></div>
+        <div><label class="field">郵遞區號</label><input type="text" id="zip"></div>
+      </div>
+
+      <label class="field">收件人</label>
+      <input type="text" id="recipient-name" placeholder="請輸入真實姓名，以利出貨作業進行">
+
+      <label class="field">聯絡電話</label>
+      <input type="tel" id="recipient-phone" placeholder="請填寫真實手機號碼，以利取貨或聯繫收貨（09xxxxxxxx）">
+
+      <label class="field">Email</label>
+      <input type="email" id="email" placeholder="訂單通知與電子發票將寄送至此信箱">
+
+      <div class="invoice">
+        <div class="section-title">發票資訊</div>
+        <div class="radios">
+          <label><input type="radio" name="invoice-type" value="personal" checked> 個人發票</label>
+          <label><input type="radio" name="invoice-type" value="company"> 公司發票</label>
+        </div>
+        <div id="invoice-personal">
+          <label class="field">手機載具（選填）</label>
+          <input type="text" id="carrier" placeholder="例：/AB1CD23">
+          <div class="muted">未填寫時將發送電子發票至贊助人信箱</div>
+        </div>
+        <div id="invoice-company" class="hidden">
+          <div class="grid-2">
+            <div><label class="field">統一編號</label><input type="text" id="tax-id" maxlength="8" placeholder="8 碼數字"></div>
+            <div><label class="field">發票抬頭</label><input type="text" id="invoice-title"></div>
+          </div>
+        </div>
+      </div>
+
+      <label class="field">備註（選填）</label>
+      <textarea id="note" rows="2"></textarea>
+
+      <div id="form-errors" class="errors hidden"></div>
+      <button type="submit" class="btn btn-primary" id="submit">確認付款 <span id="submit-total"></span></button>
+    </form>
+  </div>
+</div>
+
+<!-- processing overlay -->
+<div id="overlay" class="overlay hidden">
+  <div class="modal center">
+    <div class="spinner"></div>
+    <div id="overlay-text">訂單處理中，請勿關閉視窗…</div>
+    <div class="muted" id="overlay-sub"></div>
+  </div>
+</div>
+
+<!-- items changed modal -->
+<div id="changed" class="overlay hidden">
+  <div class="modal">
+    <h3 id="changed-title">商品資訊已更新</h3>
+    <div class="muted" id="changed-desc">下單期間商品資訊有變動，已為您更新結帳頁，請確認後再送出。</div>
+    <ul id="changed-list"></ul>
+    <button class="btn btn-primary" id="changed-ok" style="margin-top:8px">我已確認</button>
+  </div>
+</div>
+
+<script src="/common.js"></script>
+<script src="/tw-address.js"></script>
+<script src="/checkout.js"></script>
+</body>
+</html>

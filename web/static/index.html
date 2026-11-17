@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>商品列表</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="topbar"><a href="/">Checkout Demo</a><span class="sub">Go · PostgreSQL · Valkey · Kafka · Mock Payment Gateway</span><a class="nav" href="/admin.html" target="_blank" rel="noopener">Demo 後台 ↗</a></div>
+<div class="container">
+  <div class="cartbar" id="cartbar">
+    <div><b>購物車</b> <span id="cart-summary" class="muted"></span></div>
+    <div class="card-actions" style="margin:0">
+      <button class="btn btn-ghost btn-small" id="cart-clear">清空</button>
+      <a class="btn btn-primary btn-small" id="cart-go" href="#">前往結帳</a>
+    </div>
+  </div>
+
+  <h2>商品</h2>
+  <div id="cards" class="cards"></div>
+
+  <p class="muted">折扣碼：RETURN500（滿 3,000 折 500）、SAVE10（9 折）、ONCE100（只能用 1 次）。
+    信用卡測試卡號：4242 4242 4242 4242 成功、4000 0000 0000 0002 拒刷。</p>
+</div>
+<script src="/common.js"></script>
+<script>
+  let products = [];
+  let cart = readCart(); // { product_id: qty }
+
+  load();
+  // Refresh price / stock when coming back from the admin tab.
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
+
+  function readCart() {
+    try { return JSON.parse(localStorage.getItem('cart') || '{}') || {}; } catch (_) { return {}; }
+  }
+  function saveCart() {
+    try { localStorage.setItem('cart', JSON.stringify(cart)); } catch (_) { /* in-memory only */ }
+    renderCart();
+  }
+  function checkoutUrl(entries) {
+    return '/checkout.html?items=' + entries.map(([id, qty]) => `${id}:${qty}`).join(',');
+  }
+
+  function renderCart() {
+    const entries = Object.entries(cart).filter(([, q]) => q > 0);
+    const byId = Object.fromEntries(products.map((p) => [p.id, p]));
+    const count = entries.reduce((s, [, q]) => s + q, 0);
+    const total = entries.reduce((s, [id, q]) => s + (byId[id]?.price || 0) * q, 0);
+    document.getElementById('cart-summary').textContent = count
+      ? `${entries.length} 項商品・共 ${count} 件・${money(total)}`
+      : '尚未加入商品';
+    const go = document.getElementById('cart-go');
+    go.href = count ? checkoutUrl(entries) : '#';
+    go.style.opacity = count ? 1 : .5;
+    go.style.pointerEvents = count ? 'auto' : 'none';
+  }
+
+  async function load() {
+    ({ products } = await api.get('/api/products'));
+    document.getElementById('cards').innerHTML = products.filter((p) => !p.is_addon).map((p) => {
+      const max = Math.min(p.stock, 10);
+      return `
+      <div class="panel">
+        <div class="cover ${p.id === 1 ? '' : 'alt'}">${escapeHtml(p.name.length <= 6 ? p.name : p.name.slice(0, 8))}</div>
+        <div class="product-name">${escapeHtml(p.name)}</div>
+        <div class="price-row"><span class="price">${money(p.price)}</span>
+          ${discountLabel(p.price, p.original_price) ? `<span class="badge">${discountLabel(p.price, p.original_price)}</span>` : ''}</div>
+        <div class="stock-row"><span class="stock-tag ${p.stock > 20 ? 'ok' : ''}">${p.stock > 0 ? `剩餘 ${p.stock} 份` : '已售完'}</span></div>
+        <div class="card-actions">
+          <select id="qty-${p.id}" style="width:72px" ${max <= 0 ? 'disabled' : ''}>
+            ${max > 0 ? Array.from({ length: max }, (_, i) => `<option>${i + 1}</option>`).join('') : '<option>0</option>'}
+          </select>
+          <button class="btn btn-ghost btn-small" onclick="addToCart(${p.id})" ${max <= 0 ? 'disabled' : ''}>加入購物車</button>
+          <a class="btn btn-ghost btn-small" style="text-decoration:none" href="/checkout.html?product_id=${p.id}&qty=1">直接購買</a>
+        </div>
+      </div>`;
+    }).join('');
+    renderCart();
+  }
+
+  function addToCart(id) {
+    const qty = Number(document.getElementById(`qty-${id}`).value);
+    cart[id] = Math.min((cart[id] || 0) + qty, 10);
+    saveCart();
+  }
+
+  document.getElementById('cart-clear').onclick = () => { cart = {}; saveCart(); };
+</script>
+</body>
+</html>
