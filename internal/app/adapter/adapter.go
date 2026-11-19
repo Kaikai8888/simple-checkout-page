@@ -59,3 +59,19 @@ type OrderOutput struct {
 type StartPaymentOutput struct {
 	PaymentUrl string `json:"payment_url"`
 }
+
+type RegisterInput struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	Name     string `json:"name"`
+}
+
+type LoginInput struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type LoginOutput struct {
+	User         model.User `json:"user"`
+	SessionToken string     `json:"-"` // set as an HttpOnly cookie by the web layer, never in the body
+}

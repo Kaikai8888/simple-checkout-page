@@ -9,6 +9,8 @@
 <body>
 <div class="topbar"><a href="/">Demo 後台</a><span class="sub">調整商品價格 / 庫存</span><a class="nav" href="/">商品列表</a></div>
 <div class="container" style="max-width:960px">
+  <div id="denied" class="errors hidden">需要管理員帳號才能使用後台。<a href="#" id="login-link">以管理員登入</a></div>
+  <div id="admin-ui" class="hidden">
   <div class="hint">開著結帳頁，在這裡改價格或庫存，再回到結帳頁送出訂單，就能示範「價格變動 / 庫存不足」的流程。
     更新會先寫 DB，在 commit 前同步 Valkey（商品 cache 與搶購閘門），兩者都成功才算成功。</div>
   <div class="panel" style="margin-top:12px;overflow-x:auto">
@@ -25,10 +27,24 @@
     <b>可售</b>：顧客還能買的數量 ＝ 實際庫存 − 結帳中預留。送出訂單時在 PostgreSQL 直接扣這個欄位。<br>
     <b>限量搶購</b>：打勾的商品，送出訂單時會先經過 Valkey 閘門，擋掉超額的流量，避免大量請求同時搶同一列 DB 資料。
   </div>
+  </div>
 </div>
 <script src="/common.js"></script>
 <script>
-  load();
+  init();
+
+  // The page only hides itself for non-admins; the real check is the server's requireAdmin on the API.
+  async function init() {
+    const user = await currentUser();
+    renderTopbarAuth(user);
+    if (!user || user.role !== 'admin') {
+      document.getElementById('login-link').href = '/login.html?next=/admin.html';
+      document.getElementById('denied').classList.remove('hidden');
+      return;
+    }
+    document.getElementById('admin-ui').classList.remove('hidden');
+    load();
+  }
 
   async function load() {
     const { products } = await api.get('/api/products');

@@ -17,11 +17,15 @@ const state = {
   submitting: false,
   idem: null,          // { key, body } reused only when re-sending the exact same payload (network retry)
   draftId: null,       // submitted checkout we are waiting for; kept in the URL so a reload never re-submits
+  user: null,          // logged-in account (checkout requires login)
 };
 
 init();
 
 async function init() {
+  state.user = await requireLogin(); // redirects to /login.html?next=<this page> when logged out
+  if (!state.user) return;
+  $('account-email').textContent = state.user.email;
   state.cart = parseCartFromUrl();
   try {
     state.options = await api.get('/api/checkout/options');
@@ -334,7 +338,7 @@ function buildPayload() {
       recipient_name: name,
       recipient_phone: phone,
     },
-    customer: { name, email: $('email').value.trim(), phone },
+    customer: { name, email: state.user.email, phone }, // informational: the server uses the logged-in account
     invoice: invoiceType === 'company'
       ? { type: 'company', tax_id: $('tax-id').value.trim(), title: $('invoice-title').value.trim() }
       : { type: 'personal', carrier: $('carrier').value.trim().toUpperCase() },
@@ -351,7 +355,6 @@ function validate(p) {
   if (!p.shipping.recipient_name) errs.push('請填寫收件人');
   if (domestic && !/^09\d{8}$/.test(p.shipping.recipient_phone)) errs.push('請填寫正確的手機號碼（09xxxxxxxx）');
   if (!domestic && !p.shipping.recipient_phone) errs.push('請填寫聯絡電話');
-  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(p.customer.email)) errs.push('請填寫正確的 Email');
   if (p.invoice.type === 'personal' && p.invoice.carrier && !/^\/[0-9A-Z.+-]{7}$/.test(p.invoice.carrier)) errs.push('手機載具格式錯誤（例：/AB1CD23）');
   if (p.invoice.type === 'company' && !/^\d{8}$/.test(p.invoice.tax_id)) errs.push('統一編號需為 8 碼數字');
   if (p.invoice.type === 'company' && !p.invoice.title) errs.push('請填寫發票抬頭');

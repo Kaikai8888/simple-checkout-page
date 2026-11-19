@@ -30,6 +30,11 @@ const (
 )
 
 const (
+	RoleCustomer = "customer"
+	RoleAdmin    = "admin"
+)
+
+const (
 	DiscountTypeFixed   = "fixed"
 	DiscountTypePercent = "percent"
 )

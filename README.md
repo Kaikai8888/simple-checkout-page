@@ -16,10 +16,26 @@ make reset       # wipe data; DB is re-seeded on next start
 
 To run the Go app on the host instead: `make infra`, then `make run`.
 
+> **Upgrading from an older checkout:** the schema changed (accounts, draft ownership). The schema only runs on a fresh volume, so run `make reset` once before `make up`.
+
+**Tests:** `make test` runs the unit tests. `scripts/smoke-test.sh` runs the end-to-end scenarios below against a running stack (needs `curl` and `jq`), including login, ownership and admin checks.
+
+**Inspecting data with a GUI** (TablePlus, DBeaver, Postico, pgAdmin, DataGrip, ...):
+
+| | Host | Port | User / password | Database |
+|---|---|---|---|---|
+| PostgreSQL | `localhost` | `5432` | `checkout` / `checkout` | `checkout` |
+| Valkey | `localhost` | `6379` | none | `0` |
+
+Useful Valkey keys: `gate:{product_id}` (flash-sale gate), `session:{token}` (login sessions).
+
+**Accounts:** browsing is public; checkout, orders and payment need an account. Register on `/login.html`. The demo admin account is `admin@example.com` / `admin1234`, created on startup from `ADMIN_EMAIL` / `ADMIN_PASSWORD`.
+
 | URL | What |
 |---|---|
 | http://localhost:8080 | Product list with cart |
-| http://localhost:8080/admin.html | Demo admin: change price / on-hand stock, toggle flash sale; shows available vs. reserved (opens in its own tab from the top bar) |
+| http://localhost:8080/login.html | Login / register (email + password) |
+| http://localhost:8080/admin.html | Demo admin (admin account only): change price / on-hand stock, toggle flash sale; shows available vs. reserved (opens in its own tab from the top bar) |
 | http://localhost:8080/checkout.html?items=1:2,2:1 | Checkout page; `product_id:quantity` pairs come from the query string (`?product_id=1&qty=1` also works) |
 | http://localhost:9090 | Mock payment gateway; a separate server that simulates a third party |
 
@@ -66,13 +82,13 @@ cmd/main.go                      wiring, graceful shutdown
 config/                          env config
 db/migrations/                   schema + seed (run by postgres initdb)
 internal/domain/{def,model}      error codes, statuses, pricing & validation (pure, unit tested)
-internal/app/                    ProductService, CheckoutService, OrderService, PaymentService
+internal/app/                    AuthService, ProductService, CheckoutService, OrderService, PaymentService
 internal/app/adapter/            service input / output types
 internal/infra/database/repo     PostgreSQL (pgx)
-internal/infra/cache             product cache + flash-sale gate (Lua)
+internal/infra/cache             product cache, flash-sale gate (Lua), sessions, login limiter
 internal/infra/producer          Kafka producer
 internal/infra/paymentgateway    gateway client + signature verification
-internal/interfaces/web          HTTP handlers
+internal/interfaces/web          HTTP handlers, auth middleware
 internal/interfaces/consumer     Kafka consumer
 internal/interfaces/job          background jobs
 internal/mockgateway             the fake third-party payment provider
@@ -124,6 +140,30 @@ sequenceDiagram
   G-->>B: redirect to /result.html
   B->>A: GET /api/orders/{id} (poll until callback is applied)
 ```
+
+### Authentication and ownership
+- **Email + password.** Passwords are hashed with bcrypt. Emails are lower-cased.
+- **Session.** Login creates a random 256-bit token stored in Valkey (`session:{token}`, 7 days) and set as an `HttpOnly; SameSite=Lax` cookie.
+  - HttpOnly: JavaScript cannot read the token, so an XSS cannot steal it.
+  - Logout deletes the token server-side, so it is revoked immediately (a JWT could not be).
+- **Login hardening.**
+  - 10 failed logins per email in 15 minutes returns `429`.
+  - An unknown email still runs a bcrypt comparison, so response time does not reveal which emails are registered.
+  - The `?next=` redirect after login only accepts same-site paths (no open redirect).
+- **CSRF.** `SameSite=Lax` stops browsers from sending the cookie on cross-site POST/PUT. Authenticated state-changing requests must also be `application/json`, which a plain HTML form cannot send.
+- **Access rules.**
+
+  | Who | APIs |
+  |---|---|
+  | anyone | products, checkout options, register / login |
+  | logged-in shopper | coupon preview, submit checkout, draft status, orders, start payment |
+  | admin role | `PUT /api/admin/products/{id}` |
+  | gateway | payment callback, authenticated by HMAC signature instead of a session |
+
+- **Ownership (no IDOR).**
+  - Drafts store `customer_id`, and orders belong to the draft's account. The buyer is always the logged-in account, never the email in the request body.
+  - Reading a draft or order, or starting a payment, checks the owner. Someone else's resource returns **404, same as a missing one**, so ids cannot be probed.
+  - Idempotency keys are unique per account, `UNIQUE (customer_id, idempotency_key)`, so reusing another user's key never returns their draft.
 
 ### Status machines
 
@@ -199,19 +239,43 @@ Once the server accepts a checkout, the page writes the `draft_id` into its URL.
 |---|---|---|
 | GET | `/api/products`, `/api/products/{id}` | `available_stock` = what can be bought; `stock` = on hand; `flash_sale` |
 | GET | `/api/checkout/options` | shipping regions & fees, payment methods |
-| POST | `/api/coupons/preview` | `{code, subtotal}` → discount (display only) |
-| POST | `/api/checkouts` | header `Idempotency-Key`; returns `202 {draft_id}` or `400` / `409` |
-| GET | `/api/checkouts/{id}` | `{status, order_id?, error?}` |
-| GET | `/api/orders/{id}` | order + latest payment status |
-| POST | `/api/orders/{id}/payments` | creates or reuses a gateway session → `{payment_url}` |
+| POST | `/api/auth/register` | `{email, password, name}` → `201`, sets the session cookie |
+| POST | `/api/auth/login` | `{email, password}` → sets the session cookie; `401` wrong credentials, `429` too many failures |
+| POST | `/api/auth/logout` | revokes the session |
+| GET | `/api/auth/me` | current user, or `401` |
+| POST | `/api/coupons/preview` | 🔒 `{code, subtotal}` → discount (display only) |
+| POST | `/api/checkouts` | 🔒 header `Idempotency-Key`; returns `202 {draft_id}` or `400` / `409` |
+| GET | `/api/checkouts/{id}` | 🔒 owner only; `{status, order_id?, error?}` |
+| GET | `/api/orders/{id}` | 🔒 owner only; order + latest payment status |
+| POST | `/api/orders/{id}/payments` | 🔒 owner only; creates or reuses a gateway session → `{payment_url}` |
 | POST | `/api/payments/callback` | gateway → shop, `X-Signature` header |
-| PUT | `/api/admin/products/{id}` | demo only, no auth: `{price?, stock?, flash_sale?}`; changing `stock` moves `available_stock` by the same delta |
+| PUT | `/api/admin/products/{id}` | 🔒 admin only: `{price?, stock?, flash_sale?}`; changing `stock` moves `available_stock` by the same delta |
+
+🔒 = requires a logged-in session (`401` otherwise; `403` for non-admins on admin APIs).
 
 Errors look like `{"error": {"code": "ITEMS_CHANGED", "message": "...", "details": {...}}}`.
 
+## Configuration
+
+All settings are environment variables (see `config/config.go`); the defaults work for local runs.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `HTTP_ADDR` / `GATEWAY_ADDR` | `:8080` / `:9090` | API and mock gateway listen addresses |
+| `DATABASE_URL` | `postgres://checkout:checkout@localhost:5432/checkout?sslmode=disable` | |
+| `VALKEY_ADDR` | `localhost:6379` | |
+| `KAFKA_BROKERS`, `KAFKA_TOPIC`, `KAFKA_PARTITIONS`, `KAFKA_GROUP_ID` | `localhost:29092`, `checkout.requested`, `3`, `checkout-worker` | |
+| `CONSUMER_COUNT` | `3` | consumer group members in the process |
+| `APP_PUBLIC_URL`, `APP_INTERNAL_URL` | `http://localhost:8080` | redirect target / callback target for the gateway |
+| `GATEWAY_PUBLIC_URL`, `GATEWAY_API_URL`, `GATEWAY_API_KEY`, `GATEWAY_SECRET` | demo values | gateway URLs, API key, HMAC secret |
+| `PAYMENT_TTL_SECONDS` | `900` | unpaid orders expire after this |
+| `SESSION_TTL_HOURS` | `168` (7 days) | login session lifetime |
+| `COOKIE_SECURE` | `false` | set `true` when served over HTTPS |
+| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | `admin@example.com`, `admin1234` | bootstrap admin, created on startup. Demo only: use a secret store in production |
+
 ## Known limitations / next steps
 
-- **No auth.** Order ids are UUIDs, but `GET /api/orders/{id}` should check ownership (IDOR); the admin API needs auth.
+- **Auth extras.** Possible additions: email verification and password reset (they need a mail service), rotating the session id on privilege change, and re-reading the role from the DB instead of the session snapshot (today a demoted admin keeps the role until the session expires). "My orders" list page.
 - **Product cache race.** A reader could write a stale product after a writer updates it. A fix is a version-guarded `SET` (Lua comparing `version`). Correctness is unaffected: price is re-checked in the DB transaction, and stock is never served from the cache.
 - **Reservation timeout.** A held reservation lives until its draft completes or fails (the reclaim job keeps retrying). Adding `expires_at` to `inventory_reservations` would also cap how long units can be held.
 - **Display stock under extreme load.** Product pages read stock from the DB (MVCC reads never wait on locks). At flash-sale scale they could read the gate counter instead.

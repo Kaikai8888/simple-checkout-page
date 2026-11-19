@@ -32,8 +32,8 @@ type PlaceOrderParams struct {
 }
 
 // PlaceOrder creates the order in a single transaction:
-// lock products -> validate & price -> deduct stock -> commit reservation -> consume coupon -> upsert customer
-// -> insert order -> complete draft.
+// lock products -> validate & price -> deduct stock -> commit reservation -> consume coupon
+// -> insert order (owned by the draft's customer) -> complete draft.
 func (r *OrderRepo) PlaceOrder(ctx context.Context, p PlaceOrderParams) (model.Order, error) {
 	req := p.Draft.Request
 	tx, err := r.pool.Begin(ctx)
@@ -93,14 +93,7 @@ func (r *OrderRepo) PlaceOrder(ctx context.Context, p PlaceOrderParams) (model.O
 		}
 	}
 
-	var customerID int64
-	err = tx.QueryRow(ctx, `
-		INSERT INTO customers (email, name, phone) VALUES ($1, $2, $3)
-		ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, phone = EXCLUDED.phone, updated_at = now()
-		RETURNING id`, req.Customer.Email, req.Customer.Name, req.Customer.Phone).Scan(&customerID)
-	if err != nil {
-		return model.Order{}, fmt.Errorf("upsert customer: %w", err)
-	}
+	customerID := p.Draft.CustomerID // the order belongs to the account that submitted the checkout
 
 	shipping, _ := json.Marshal(req.Shipping)
 	invoice, _ := json.Marshal(req.Invoice)

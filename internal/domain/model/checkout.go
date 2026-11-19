@@ -66,6 +66,7 @@ type CheckoutRequest struct {
 
 type CheckoutDraft struct {
 	ID             string
+	CustomerID     int64 // owner
 	IdempotencyKey string
 	Request        CheckoutRequest
 	Status         string

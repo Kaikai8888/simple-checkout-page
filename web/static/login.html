@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登入</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="topbar"><a href="/">← 商品列表</a><span class="sub">Checkout Demo</span></div>
+<div class="container">
+  <div class="panel auth-card">
+    <div class="tabs">
+      <button type="button" id="tab-login" class="active">登入</button>
+      <button type="button" id="tab-register">註冊</button>
+    </div>
+    <form id="form" novalidate>
+      <div id="name-field" class="hidden">
+        <label class="field">姓名</label>
+        <input type="text" id="name" autocomplete="name">
+      </div>
+      <label class="field">Email</label>
+      <input type="email" id="email" autocomplete="email">
+      <label class="field">密碼</label>
+      <input type="password" id="password" autocomplete="current-password" placeholder="至少 8 個字元">
+      <div id="errors" class="errors hidden"></div>
+      <button type="submit" class="btn btn-primary" id="submit">登入</button>
+    </form>
+    <p class="muted" style="margin-top:16px">Demo 管理員帳號：admin@example.com / admin1234</p>
+  </div>
+</div>
+<script src="/common.js"></script>
+<script>
+  const $ = (id) => document.getElementById(id);
+  let mode = 'login';
+
+  // Only allow same-site relative paths, so ?next= cannot be abused as an open redirect.
+  function nextUrl() {
+    const next = new URLSearchParams(location.search).get('next') || '/';
+    return next.startsWith('/') && !next.startsWith('//') && !next.startsWith('/\\') ? next : '/';
+  }
+
+  function setMode(m) {
+    mode = m;
+    $('tab-login').classList.toggle('active', m === 'login');
+    $('tab-register').classList.toggle('active', m === 'register');
+    $('name-field').classList.toggle('hidden', m === 'login');
+    $('password').autocomplete = m === 'login' ? 'current-password' : 'new-password';
+    $('submit').textContent = m === 'login' ? '登入' : '註冊並登入';
+    $('errors').classList.add('hidden');
+  }
+  $('tab-login').onclick = () => setMode('login');
+  $('tab-register').onclick = () => setMode('register');
+
+  // Already logged in: go straight back.
+  currentUser().then((u) => { if (u) location.replace(nextUrl()); });
+
+  $('form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const body = { email: $('email').value.trim(), password: $('password').value };
+    if (mode === 'register') body.name = $('name').value.trim();
+    $('submit').disabled = true;
+    try {
+      await api.post(mode === 'login' ? '/api/auth/login' : '/api/auth/register', body);
+      location.replace(nextUrl());
+    } catch (err) {
+      const list = Array.isArray(err.details) ? err.details : [err.message];
+      $('errors').innerHTML = list.map((m) => `<div>${escapeHtml(m)}</div>`).join('');
+      $('errors').classList.remove('hidden');
+      $('submit').disabled = false;
+    }
+  });
+</script>
+</body>
+</html>

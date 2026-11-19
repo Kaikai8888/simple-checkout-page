@@ -48,18 +48,20 @@ func NewCheckoutService(drafts *repo.DraftRepo, orders *repo.OrderRepo, coupons 
 // Stock reservation is hybrid:
 //  1. flash-sale items first pass the Valkey gate (sheds excess traffic before it reaches the hot DB row)
 //  2. every item is reserved from products.available_stock in the same DB transaction that inserts the draft
-func (s *CheckoutService) Submit(ctx context.Context, idempotencyKey string, in adapter.SubmitCheckoutInput) (adapter.SubmitCheckoutOutput, error) {
+func (s *CheckoutService) Submit(ctx context.Context, user model.User, idempotencyKey string, in adapter.SubmitCheckoutInput) (adapter.SubmitCheckoutOutput, error) {
 	idempotencyKey = strings.TrimSpace(idempotencyKey)
 	if idempotencyKey == "" || len(idempotencyKey) > 128 {
 		return adapter.SubmitCheckoutOutput{}, def.NewError(def.ErrInvalidRequest, "Idempotency-Key header is required")
 	}
 	req := in.ToModel()
+	// The buyer is the logged-in account, never whatever email the client put in the payload.
+	req.Customer = model.CustomerInfo{Name: user.Name, Email: user.Email, Phone: req.Shipping.RecipientPhone}
 	if err := req.Validate(); err != nil {
 		return adapter.SubmitCheckoutOutput{}, err
 	}
 
 	// Replay of an already-submitted request (double click / network retry): don't reserve again.
-	if existing, err := s.drafts.GetByIdempotencyKey(ctx, idempotencyKey); err != nil {
+	if existing, err := s.drafts.GetByIdempotencyKey(ctx, user.ID, idempotencyKey); err != nil {
 		return adapter.SubmitCheckoutOutput{}, err
 	} else if existing != nil {
 		return adapter.SubmitCheckoutOutput{DraftID: existing.ID, Status: existing.Status}, nil
@@ -74,7 +76,7 @@ func (s *CheckoutService) Submit(ctx context.Context, idempotencyKey string, in 
 		return adapter.SubmitCheckoutOutput{}, err // sold out at the gate: the DB was never touched
 	}
 
-	draftID, created, err := s.drafts.CreateWithReservation(ctx, uuid.NewString(), idempotencyKey, req)
+	draftID, created, err := s.drafts.CreateWithReservation(ctx, uuid.NewString(), user.ID, idempotencyKey, req)
 	if err != nil || !created {
 		s.products.ReturnToGate(ctx, taken) // DB said no (or duplicate request): give the gate units back
 	}
@@ -92,12 +94,13 @@ func (s *CheckoutService) Submit(ctx context.Context, idempotencyKey string, in 
 	return adapter.SubmitCheckoutOutput{DraftID: draftID, Status: def.DraftStatusPending}, nil
 }
 
-func (s *CheckoutService) GetStatus(ctx context.Context, draftID string) (adapter.DraftStatusOutput, error) {
+// GetStatus only returns the caller's own drafts; someone else's draft looks exactly like a missing one.
+func (s *CheckoutService) GetStatus(ctx context.Context, user model.User, draftID string) (adapter.DraftStatusOutput, error) {
 	d, err := s.drafts.Get(ctx, draftID)
 	if err != nil {
 		return adapter.DraftStatusOutput{}, err
 	}
-	if d == nil {
+	if d == nil || d.CustomerID != user.ID {
 		return adapter.DraftStatusOutput{}, def.NewError(def.ErrDraftNotFound, "checkout not found")
 	}
 	out := adapter.DraftStatusOutput{DraftID: d.ID, Status: d.Status, OrderID: d.OrderID}

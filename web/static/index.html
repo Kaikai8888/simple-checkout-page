@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<div class="topbar"><a href="/">Checkout Demo</a><span class="sub">Go · PostgreSQL · Valkey · Kafka · Mock Payment Gateway</span><a class="nav" href="/admin.html" target="_blank" rel="noopener">Demo 後台 ↗</a></div>
+<div class="topbar"><a href="/">Checkout Demo</a><span class="sub">Go · PostgreSQL · Valkey · Kafka · Mock Payment Gateway</span><a class="nav admin-link hidden" href="/admin.html" target="_blank" rel="noopener">Demo 後台 ↗</a></div>
 <div class="container">
   <div class="cartbar" id="cartbar">
     <div><b>購物車</b> <span id="cart-summary" class="muted"></span></div>
@@ -29,6 +29,7 @@
   let cart = readCart(); // { product_id: qty }
 
   load();
+  currentUser().then(renderTopbarAuth);
   // Refresh price / stock when coming back from the admin tab.
   document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
 

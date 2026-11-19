@@ -20,16 +20,19 @@ import (
 const maxBodyBytes = 1 << 20
 
 type Server struct {
-	products *app.ProductService
-	checkout *app.CheckoutService
-	orders   *app.OrderService
-	payments *app.PaymentService
-	static   fs.FS
+	auth         *app.AuthService
+	products     *app.ProductService
+	checkout     *app.CheckoutService
+	orders       *app.OrderService
+	payments     *app.PaymentService
+	static       fs.FS
+	cookieSecure bool
 }
 
-func NewServer(products *app.ProductService, checkout *app.CheckoutService, orders *app.OrderService,
-	payments *app.PaymentService, static fs.FS) *Server {
-	return &Server{products: products, checkout: checkout, orders: orders, payments: payments, static: static}
+func NewServer(auth *app.AuthService, products *app.ProductService, checkout *app.CheckoutService, orders *app.OrderService,
+	payments *app.PaymentService, static fs.FS, cookieSecure bool) *Server {
+	return &Server{auth: auth, products: products, checkout: checkout, orders: orders, payments: payments,
+		static: static, cookieSecure: cookieSecure}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -38,17 +41,28 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
+	// auth
+	mux.HandleFunc("POST /api/auth/register", s.register)
+	mux.HandleFunc("POST /api/auth/login", s.login)
+	mux.HandleFunc("POST /api/auth/logout", s.logout)
+	mux.HandleFunc("GET /api/auth/me", s.requireUser(s.me))
+
+	// public: browsing
 	mux.HandleFunc("GET /api/products", s.listProducts)
 	mux.HandleFunc("GET /api/products/{id}", s.getProduct)
-	mux.HandleFunc("PUT /api/admin/products/{id}", s.updateProduct)
-
 	mux.HandleFunc("GET /api/checkout/options", s.checkoutOptions)
-	mux.HandleFunc("POST /api/coupons/preview", s.previewCoupon)
-	mux.HandleFunc("POST /api/checkouts", s.submitCheckout)
-	mux.HandleFunc("GET /api/checkouts/{id}", s.getCheckout)
 
-	mux.HandleFunc("GET /api/orders/{id}", s.getOrder)
-	mux.HandleFunc("POST /api/orders/{id}/payments", s.startPayment)
+	// logged-in shopper; services also check the draft / order belongs to the caller
+	mux.HandleFunc("POST /api/coupons/preview", s.requireUser(s.previewCoupon))
+	mux.HandleFunc("POST /api/checkouts", s.requireUser(s.submitCheckout))
+	mux.HandleFunc("GET /api/checkouts/{id}", s.requireUser(s.getCheckout))
+	mux.HandleFunc("GET /api/orders/{id}", s.requireUser(s.getOrder))
+	mux.HandleFunc("POST /api/orders/{id}/payments", s.requireUser(s.startPayment))
+
+	// admin only
+	mux.HandleFunc("PUT /api/admin/products/{id}", s.requireAdmin(s.updateProduct))
+
+	// server-to-server: authenticated by the gateway's HMAC signature, not by a user session
 	mux.HandleFunc("POST /api/payments/callback", s.paymentCallback)
 
 	mux.Handle("GET /", http.FileServerFS(s.static))
@@ -124,7 +138,7 @@ func (s *Server) submitCheckout(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &in) {
 		return
 	}
-	out, err := s.checkout.Submit(r.Context(), r.Header.Get("Idempotency-Key"), in)
+	out, err := s.checkout.Submit(r.Context(), userFrom(r), r.Header.Get("Idempotency-Key"), in)
 	if err != nil {
 		writeError(w, r, err)
 		return
@@ -133,7 +147,7 @@ func (s *Server) submitCheckout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getCheckout(w http.ResponseWriter, r *http.Request) {
-	out, err := s.checkout.GetStatus(r.Context(), r.PathValue("id"))
+	out, err := s.checkout.GetStatus(r.Context(), userFrom(r), r.PathValue("id"))
 	if err != nil {
 		writeError(w, r, err)
 		return
@@ -142,7 +156,7 @@ func (s *Server) getCheckout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
-	out, err := s.orders.GetOrder(r.Context(), r.PathValue("id"))
+	out, err := s.orders.GetOrder(r.Context(), userFrom(r), r.PathValue("id"))
 	if err != nil {
 		writeError(w, r, err)
 		return
@@ -151,7 +165,7 @@ func (s *Server) getOrder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) startPayment(w http.ResponseWriter, r *http.Request) {
-	out, err := s.payments.StartPayment(r.Context(), r.PathValue("id"))
+	out, err := s.payments.StartPayment(r.Context(), userFrom(r), r.PathValue("id"))
 	if err != nil {
 		writeError(w, r, err)
 		return
@@ -199,8 +213,14 @@ func statusOf(code def.ErrorCode) int {
 	switch code {
 	case def.ErrInvalidRequest:
 		return http.StatusBadRequest
-	case def.ErrInvalidSignature:
+	case def.ErrInvalidSignature, def.ErrUnauthorized, def.ErrInvalidLogin:
 		return http.StatusUnauthorized
+	case def.ErrForbidden:
+		return http.StatusForbidden
+	case def.ErrEmailTaken:
+		return http.StatusConflict
+	case def.ErrTooManyAttempts:
+		return http.StatusTooManyRequests
 	case def.ErrProductNotFound, def.ErrDraftNotFound, def.ErrOrderNotFound, def.ErrPaymentNotFound:
 		return http.StatusNotFound
 	case def.ErrItemsChanged, def.ErrAmountMismatch, def.ErrOrderNotPayable:

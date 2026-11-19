@@ -7,6 +7,10 @@ BASE=${BASE:-http://localhost:8080}
 GW=${GW:-http://localhost:9090}
 PASS=0
 FAIL=0
+JAR_DIR=$(mktemp -d)
+ANON_JAR=$JAR_DIR/anon; SHOPPER_JAR=$JAR_DIR/shopper; OTHER_JAR=$JAR_DIR/other; ADMIN_JAR=$JAR_DIR/admin
+JAR=$SHOPPER_JAR   # cookie jar of the "current" user for call()
+trap 'rm -rf "$JAR_DIR"' EXIT
 
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -18,7 +22,7 @@ check() { # check "description" actual expected
 
 # call METHOD PATH [BODY] [IDEMPOTENCY_KEY] -> sets $STATUS and $BODY
 call() {
-  local args=(-s -m 10 -X "$1" "$BASE$2" -H 'Content-Type: application/json' -w $'\n%{http_code}')
+  local args=(-s -m 10 -X "$1" "$BASE$2" -H 'Content-Type: application/json' -b "$JAR" -c "$JAR" -w $'\n%{http_code}')
   [[ -n "${3:-}" ]] && args+=(-d "$3")
   [[ -n "${4:-}" ]] && args+=(-H "Idempotency-Key: $4")
   local out; out=$(curl "${args[@]}")
@@ -26,7 +30,9 @@ call() {
   BODY=$(sed '$d' <<<"$out")
 }
 
-set_product() { call PUT "/api/admin/products/$1" "{\"price\":$2,\"stock\":$3}"; }
+set_product() { local me=$JAR; JAR=$ADMIN_JAR; call PUT "/api/admin/products/$1" "{\"price\":$2,\"stock\":$3}"; JAR=$me; }
+as()          { JAR=$1; }   # switch the current user: as "$OTHER_JAR"
+uniq_email()  { echo "smoke-$(date +%s)-$RANDOM@example.com"; }
 stock_of()    { call GET "/api/products/$1"; jq -r .available_stock <<<"$BODY"; }
 key()         { echo "smoke-$(date +%s)-$RANDOM$RANDOM"; }
 
@@ -68,8 +74,37 @@ pay() {
 }
 
 title "0. health"
+# right after `make up` the app may still be connecting to Postgres / Kafka: wait up to 60s
+for _ in $(seq 1 60); do
+  curl -s -m 2 -o /dev/null "$BASE/healthz" && break
+  sleep 1
+done
 call GET /healthz
 check "API is up" "$STATUS" 200
+
+title "0b. auth: login required, register, login"
+as "$ANON_JAR"
+call GET /api/products
+check "browsing products is public" "$STATUS" 200
+call POST /api/checkouts "$(payload '[{"product_id":1,"quantity":1,"unit_price":5500}]' 5500)" "$(key)"
+check "checkout without login -> 401" "$STATUS" 401
+call GET /api/auth/me
+check "me without login -> 401" "$STATUS" 401
+as "$SHOPPER_JAR"
+SHOPPER_EMAIL=$(uniq_email)
+call POST /api/auth/register "{\"email\":\"$SHOPPER_EMAIL\",\"password\":\"password123\",\"name\":\"測試者\"}"
+check "register -> 201" "$STATUS" 201
+call POST /api/auth/register "{\"email\":\"$SHOPPER_EMAIL\",\"password\":\"password123\",\"name\":\"測試者\"}"
+check "same email again -> 409" "$STATUS" 409
+call GET /api/auth/me
+check "me returns the account" "$(jq -r .user.email <<<"$BODY")" "$SHOPPER_EMAIL"
+as "$ANON_JAR"
+call POST /api/auth/login "{\"email\":\"$SHOPPER_EMAIL\",\"password\":\"wrong-password\"}"
+check "wrong password -> 401" "$STATUS" 401
+as "$ADMIN_JAR"
+call POST /api/auth/login '{"email":"admin@example.com","password":"admin1234"}'
+check "admin login -> 200" "$STATUS" 200
+as "$SHOPPER_JAR"
 set_product 1 5500 10 >/dev/null; set_product 101 300 50 >/dev/null
 
 title "1. happy path: main product + add-on, credit card success"
@@ -121,7 +156,7 @@ title "5. two shoppers race for the last unit (flash sale product, Valkey gate)"
 set_product 1 5500 1 >/dev/null
 P=$(payload '[{"product_id":1,"quantity":1,"unit_price":5500}]' 5500)
 for i in 1 2; do
-  curl -s -m 10 -o /dev/null -w '%{http_code}\n' -X POST "$BASE/api/checkouts" -H 'Content-Type: application/json' \
+  curl -s -m 10 -o /dev/null -w '%{http_code}\n' -X POST "$BASE/api/checkouts" -H 'Content-Type: application/json' -b "$JAR" \
     -H "Idempotency-Key: $(key)-$i" -d "$P" &
 done > "${TMPDIR:-/tmp}/race.txt"
 wait
@@ -134,7 +169,7 @@ title "5b. two shoppers race for the last unit (normal product, DB row lock)"
 set_product 2 1980 1 >/dev/null
 P=$(payload '[{"product_id":2,"quantity":1,"unit_price":1980}]' 1980)
 for i in 1 2; do
-  curl -s -m 10 -o /dev/null -w '%{http_code}\n' -X POST "$BASE/api/checkouts" -H 'Content-Type: application/json' \
+  curl -s -m 10 -o /dev/null -w '%{http_code}\n' -X POST "$BASE/api/checkouts" -H 'Content-Type: application/json' -b "$JAR" \
     -H "Idempotency-Key: $(key)-$i" -d "$P" &
 done > "${TMPDIR:-/tmp}/race2.txt"
 wait
@@ -207,8 +242,38 @@ check "short product is #101" "$(jq -r '.error.details.items[0].product_id' <<<"
 check "product 2 not reserved (still 17)" "$(stock_of 2)" 17
 
 title "14. admin rejects invalid stock"
+as "$ADMIN_JAR"
 call PUT /api/admin/products/2 '{"stock":-1}'
 check "negative stock rejected" "$STATUS" 400
+as "$SHOPPER_JAR"
+
+title "15. orders and drafts belong to their account"
+set_product 1 5500 10 >/dev/null
+K=$(key)
+submit "$(payload '[{"product_id":1,"quantity":1,"unit_price":5500}]' 5500)" "$K"
+MY_DRAFT=$DRAFT_ID
+wait_draft "$MY_DRAFT"; MY_ORDER=$(jq -r .order_id <<<"$DRAFT")
+check "my order created" "$(jq -r .status <<<"$DRAFT")" completed
+call GET "/api/orders/$MY_ORDER"
+check "owner can read the order" "$STATUS" 200
+as "$OTHER_JAR"
+call POST /api/auth/register "{\"email\":\"$(uniq_email)\",\"password\":\"password123\",\"name\":\"別人\"}"
+check "second account registered" "$STATUS" 201
+call GET "/api/orders/$MY_ORDER"
+check "other account cannot read my order (404)" "$STATUS" 404
+call GET "/api/checkouts/$MY_DRAFT"
+check "other account cannot read my draft (404)" "$STATUS" 404
+call POST "/api/orders/$MY_ORDER/payments"
+check "other account cannot pay my order (404)" "$STATUS" 404
+call PUT /api/admin/products/1 '{"price":1}'
+check "non-admin cannot use admin API (403)" "$STATUS" 403
+submit "$(payload '[{"product_id":1,"quantity":1,"unit_price":5500}]' 5500)" "$K"
+check "same idempotency key from another account is a different draft" "$([[ -n "$DRAFT_ID" && "$DRAFT_ID" != "$MY_DRAFT" ]] && echo yes)" yes
+as "$SHOPPER_JAR"
+call POST /api/auth/logout
+check "logout" "$STATUS" 200
+call GET "/api/orders/$MY_ORDER"
+check "after logout the order needs login again (401)" "$STATUS" 401
 
 set_product 1 5500 10 >/dev/null; set_product 2 1980 100 >/dev/null; set_product 101 300 50 >/dev/null
 printf '\n\033[1mResult: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"

@@ -6,6 +6,11 @@ type ErrorCode string
 
 const (
 	ErrInvalidRequest   ErrorCode = "INVALID_REQUEST"
+	ErrUnauthorized     ErrorCode = "UNAUTHORIZED"        // not logged in / session expired
+	ErrForbidden        ErrorCode = "FORBIDDEN"           // logged in but not allowed (e.g. not admin)
+	ErrInvalidLogin     ErrorCode = "INVALID_CREDENTIALS" // wrong email or password
+	ErrEmailTaken       ErrorCode = "EMAIL_TAKEN"
+	ErrTooManyAttempts  ErrorCode = "TOO_MANY_ATTEMPTS"
 	ErrProductNotFound  ErrorCode = "PRODUCT_NOT_FOUND"
 	ErrItemsChanged     ErrorCode = "ITEMS_CHANGED" // price changed / stock insufficient / sold out
 	ErrCouponInvalid    ErrorCode = "COUPON_INVALID"

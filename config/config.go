@@ -28,6 +28,11 @@ type Config struct {
 	GatewaySecret    string
 
 	PaymentTTL time.Duration // unpaid orders expire after this and stock is released
+
+	SessionTTL    time.Duration
+	CookieSecure  bool   // set true when served over HTTPS
+	AdminEmail    string // bootstrap admin account (demo only; use a secret store in production)
+	AdminPassword string
 }
 
 func Load() Config {
@@ -52,6 +57,11 @@ func Load() Config {
 		GatewaySecret:    env("GATEWAY_SECRET", "demo-webhook-secret"),
 
 		PaymentTTL: time.Duration(envInt("PAYMENT_TTL_SECONDS", 900)) * time.Second,
+
+		SessionTTL:    time.Duration(envInt("SESSION_TTL_HOURS", 24*7)) * time.Hour,
+		CookieSecure:  env("COOKIE_SECURE", "false") == "true",
+		AdminEmail:    env("ADMIN_EMAIL", "admin@example.com"),
+		AdminPassword: env("ADMIN_PASSWORD", "admin1234"),
 	}
 }
 

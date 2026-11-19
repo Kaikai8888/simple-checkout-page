@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<div class="topbar"><a href="/">← 商品列表</a><span class="sub">Checkout Demo</span><a class="nav" href="/admin.html" target="_blank" rel="noopener">Demo 後台 ↗</a></div>
+<div class="topbar"><a href="/">← 商品列表</a><span class="sub">Checkout Demo</span><a class="nav admin-link hidden" href="/admin.html" target="_blank" rel="noopener">Demo 後台 ↗</a></div>
 
 <div class="container">
   <div id="load-error" class="errors hidden"></div>
@@ -74,8 +74,9 @@
       <label class="field">聯絡電話</label>
       <input type="tel" id="recipient-phone" placeholder="請填寫真實手機號碼，以利取貨或聯繫收貨（09xxxxxxxx）">
 
-      <label class="field">Email</label>
-      <input type="email" id="email" placeholder="訂單通知與電子發票將寄送至此信箱">
+      <label class="field">訂購帳號</label>
+      <div class="readonly-field" id="account-email"></div>
+      <div class="muted">訂單通知與電子發票將寄送至此信箱</div>
 
       <div class="invoice">
         <div class="section-title">發票資訊</div>

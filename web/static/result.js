@@ -7,6 +7,7 @@ const orderId = new URLSearchParams(location.search).get('order_id');
 main();
 
 async function main() {
+  if (!(await requireLogin())) return;
   if (!orderId) return showError('缺少訂單編號');
   const started = Date.now();
   while (true) {
@@ -14,7 +15,8 @@ async function main() {
     try {
       order = await api.get(`/api/orders/${encodeURIComponent(orderId)}`);
     } catch (err) {
-      return showError(err.message);
+      // 404 also covers "this order belongs to another account" (we never reveal which)
+      return showError(err.status === 404 ? '找不到這筆訂單，或您沒有權限查看。' : err.message);
     }
     render(order);
     const waitingCallback = order.status === 'pending_payment' && order.latest_payment?.status === 'pending';

@@ -6,6 +6,7 @@ import (
 
 	"checkout/internal/app/adapter"
 	"checkout/internal/domain/def"
+	"checkout/internal/domain/model"
 	"checkout/internal/infra/database/repo"
 )
 
@@ -21,12 +22,13 @@ func NewOrderService(orders *repo.OrderRepo, payments *repo.PaymentRepo, product
 	return &OrderService{orders: orders, payments: payments, products: products}
 }
 
-func (s *OrderService) GetOrder(ctx context.Context, id string) (adapter.OrderOutput, error) {
+// GetOrder only returns the caller's own orders; someone else's order looks exactly like a missing one (no IDOR).
+func (s *OrderService) GetOrder(ctx context.Context, user model.User, id string) (adapter.OrderOutput, error) {
 	o, err := s.orders.Get(ctx, id)
 	if err != nil {
 		return adapter.OrderOutput{}, err
 	}
-	if o == nil {
+	if o == nil || o.CustomerID != user.ID {
 		return adapter.OrderOutput{}, def.NewError(def.ErrOrderNotFound, "order not found")
 	}
 	out := adapter.OrderOutput{Order: *o}

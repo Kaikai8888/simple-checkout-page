@@ -16,7 +16,7 @@ import (
 	"checkout/internal/domain/model"
 )
 
-const draftColumns = "id, idempotency_key, payload, status, attempts, COALESCE(error_code, ''), COALESCE(error_message, ''), error_details, COALESCE(order_id, ''), created_at, updated_at"
+const draftColumns = "id, customer_id, idempotency_key, payload, status, attempts, COALESCE(error_code, ''), COALESCE(error_message, ''), error_details, COALESCE(order_id, ''), created_at, updated_at"
 
 type DraftRepo struct {
 	pool *pgxpool.Pool
@@ -41,8 +41,8 @@ const (
 
 // CreateWithReservation inserts a pending draft and reserves available_stock for every item in ONE transaction:
 // either the draft exists and all its units are held, or nothing happened.
-// If the idempotency key was already used, the existing draft id is returned with created = false.
-func (r *DraftRepo) CreateWithReservation(ctx context.Context, id, idempotencyKey string, req model.CheckoutRequest) (draftID string, created bool, err error) {
+// If this customer already used the idempotency key, the existing draft id is returned with created = false.
+func (r *DraftRepo) CreateWithReservation(ctx context.Context, id string, customerID int64, idempotencyKey string, req model.CheckoutRequest) (draftID string, created bool, err error) {
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return "", false, fmt.Errorf("marshal draft payload: %w", err)
@@ -54,13 +54,14 @@ func (r *DraftRepo) CreateWithReservation(ctx context.Context, id, idempotencyKe
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	err = tx.QueryRow(ctx, `
-		INSERT INTO checkout_drafts (id, idempotency_key, payload, status)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (idempotency_key) DO NOTHING
-		RETURNING id`, id, idempotencyKey, payload, def.DraftStatusPending).Scan(&draftID)
+		INSERT INTO checkout_drafts (id, customer_id, idempotency_key, payload, status)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (customer_id, idempotency_key) DO NOTHING
+		RETURNING id`, id, customerID, idempotencyKey, payload, def.DraftStatusPending).Scan(&draftID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		// concurrent request with the same key won the race
-		if err := r.pool.QueryRow(ctx, "SELECT id FROM checkout_drafts WHERE idempotency_key = $1", idempotencyKey).Scan(&draftID); err != nil {
+		// concurrent request from the same customer with the same key won the race
+		if err := r.pool.QueryRow(ctx, "SELECT id FROM checkout_drafts WHERE customer_id = $1 AND idempotency_key = $2",
+			customerID, idempotencyKey).Scan(&draftID); err != nil {
 			return "", false, fmt.Errorf("get draft by idempotency key: %w", err)
 		}
 		return draftID, false, nil
@@ -111,9 +112,10 @@ func (r *DraftRepo) shortageError(ctx context.Context, it model.CheckoutItem) er
 	return def.NewError(def.ErrItemsChanged, "商品庫存不足，請確認後重新送出").WithDetails(map[string]any{"items": []model.ItemIssue{issue}})
 }
 
-// GetByIdempotencyKey returns nil when the key has not been used.
-func (r *DraftRepo) GetByIdempotencyKey(ctx context.Context, key string) (*model.CheckoutDraft, error) {
-	d, err := scanDraft(r.pool.QueryRow(ctx, "SELECT "+draftColumns+" FROM checkout_drafts WHERE idempotency_key = $1", key))
+// GetByIdempotencyKey returns nil when this customer has not used the key.
+func (r *DraftRepo) GetByIdempotencyKey(ctx context.Context, customerID int64, key string) (*model.CheckoutDraft, error) {
+	d, err := scanDraft(r.pool.QueryRow(ctx, "SELECT "+draftColumns+" FROM checkout_drafts WHERE customer_id = $1 AND idempotency_key = $2",
+		customerID, key))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -234,7 +236,7 @@ func (r *DraftRepo) ReclaimStale(ctx context.Context, pendingAfter, processingAf
 func scanDraft(row pgx.Row) (*model.CheckoutDraft, error) {
 	var d model.CheckoutDraft
 	var payload, details []byte
-	err := row.Scan(&d.ID, &d.IdempotencyKey, &payload, &d.Status, &d.Attempts, &d.ErrorCode,
+	err := row.Scan(&d.ID, &d.CustomerID, &d.IdempotencyKey, &payload, &d.Status, &d.Attempts, &d.ErrorCode,
 		&d.ErrorMessage, &details, &d.OrderID, &d.CreatedAt, &d.UpdatedAt)
 	if err != nil {
 		return nil, err

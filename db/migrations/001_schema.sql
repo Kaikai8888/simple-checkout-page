@@ -30,11 +30,14 @@ CREATE TABLE coupons (
     expires_at    TIMESTAMPTZ
 );
 
+-- Shopper / admin accounts (email + password login).
 CREATE TABLE customers (
-    id         BIGSERIAL PRIMARY KEY,
-    email      TEXT        NOT NULL UNIQUE,
-    name       TEXT        NOT NULL,
-    phone      TEXT        NOT NULL,
+    id            BIGSERIAL PRIMARY KEY,
+    email         TEXT        NOT NULL UNIQUE, -- stored lower-cased
+    name          TEXT        NOT NULL,
+    phone         TEXT        NOT NULL DEFAULT '',
+    password_hash TEXT        NOT NULL,        -- bcrypt
+    role          TEXT        NOT NULL DEFAULT 'customer' CHECK (role IN ('customer', 'admin')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -42,7 +45,8 @@ CREATE TABLE customers (
 -- Checkout draft: what the shopper submitted. Processed asynchronously by the worker.
 CREATE TABLE checkout_drafts (
     id              TEXT PRIMARY KEY,
-    idempotency_key TEXT        NOT NULL UNIQUE,
+    customer_id     BIGINT      NOT NULL REFERENCES customers (id), -- owner
+    idempotency_key TEXT        NOT NULL,
     payload         JSONB       NOT NULL,
     status          TEXT        NOT NULL, -- pending / processing / completed / failed
     attempts        INT         NOT NULL DEFAULT 0,
@@ -51,7 +55,8 @@ CREATE TABLE checkout_drafts (
     error_details   JSONB,
     order_id        TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (customer_id, idempotency_key) -- keys are scoped per account: guessing someone else's key reveals nothing
 );
 CREATE INDEX idx_checkout_drafts_status_updated ON checkout_drafts (status, updated_at);
 
@@ -89,6 +94,7 @@ CREATE TABLE orders (
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_orders_status_expires ON orders (status, expires_at);
+CREATE INDEX idx_orders_customer ON orders (customer_id, created_at DESC);
 
 CREATE TABLE order_items (
     id         BIGSERIAL PRIMARY KEY,

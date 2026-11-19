@@ -67,14 +67,20 @@ func run() error {
 	orderRepo := repo.NewOrderRepo(pool)
 	couponRepo := repo.NewCouponRepo(pool)
 	paymentRepo := repo.NewPaymentRepo(pool)
+	customerRepo := repo.NewCustomerRepo(pool)
 	gatewayClient := paymentgateway.NewClient(cfg.GatewayApiUrl, cfg.GatewayApiKey, cfg.GatewaySecret)
 
 	// ---- app ----
+	authSvc := app.NewAuthService(customerRepo, cache.NewSessionStore(valkey, cfg.SessionTTL),
+		cache.NewLoginLimiter(valkey, 10, 15*time.Minute))
 	productSvc := app.NewProductService(productRepo, cache.NewProductCache(valkey), cache.NewFlashSaleGate(valkey))
 	checkoutSvc := app.NewCheckoutService(draftRepo, orderRepo, couponRepo, productSvc, checkoutProducer, cfg.PaymentTTL)
 	orderSvc := app.NewOrderService(orderRepo, paymentRepo, productSvc)
 	paymentSvc := app.NewPaymentService(orderRepo, paymentRepo, gatewayClient, cfg.AppPublicUrl, cfg.AppInternalUrl)
 
+	if err := authSvc.EnsureAdmin(ctx, cfg.AdminEmail, cfg.AdminPassword); err != nil {
+		return fmt.Errorf("ensure admin account: %w", err)
+	}
 	if err := productSvc.WarmUp(ctx); err != nil {
 		return fmt.Errorf("warm up product cache: %w", err)
 	}
@@ -90,7 +96,7 @@ func run() error {
 		}()
 	}
 
-	apiServer := &http.Server{Addr: cfg.HTTPAddr, Handler: web.NewServer(productSvc, checkoutSvc, orderSvc, paymentSvc, staticfs.Static()).Handler(),
+	apiServer := &http.Server{Addr: cfg.HTTPAddr, Handler: web.NewServer(authSvc, productSvc, checkoutSvc, orderSvc, paymentSvc, staticfs.Static(), cfg.CookieSecure).Handler(),
 		ReadHeaderTimeout: 5 * time.Second}
 	start("api", func() { serve(apiServer, "api") })
 

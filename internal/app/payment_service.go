@@ -31,12 +31,13 @@ func NewPaymentService(orders *repo.OrderRepo, payments *repo.PaymentRepo, gatew
 }
 
 // StartPayment creates (or reuses) a payment session at the gateway and returns the URL to redirect the shopper to.
-func (s *PaymentService) StartPayment(ctx context.Context, orderID string) (adapter.StartPaymentOutput, error) {
+// Only the order's owner can start a payment for it.
+func (s *PaymentService) StartPayment(ctx context.Context, user model.User, orderID string) (adapter.StartPaymentOutput, error) {
 	order, err := s.orders.Get(ctx, orderID)
 	if err != nil {
 		return adapter.StartPaymentOutput{}, err
 	}
-	if order == nil {
+	if order == nil || order.CustomerID != user.ID {
 		return adapter.StartPaymentOutput{}, def.NewError(def.ErrOrderNotFound, "order not found")
 	}
 	if order.Status != def.OrderStatusPendingPayment || s.now().After(order.ExpiresAt) {

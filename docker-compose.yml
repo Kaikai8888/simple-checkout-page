@@ -63,6 +63,9 @@ services:
       GATEWAY_PUBLIC_URL: http://localhost:9090
       GATEWAY_API_URL: http://localhost:9090
       PAYMENT_TTL_SECONDS: "900"
+      ADMIN_EMAIL: admin@example.com    # demo admin, created on startup
+      ADMIN_PASSWORD: admin1234         # demo only - use a secret store in production
+      COOKIE_SECURE: "false"            # true when served over HTTPS
 
 volumes:
   pgdata:
