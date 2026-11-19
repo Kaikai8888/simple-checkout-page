@@ -19,7 +19,7 @@ To run the Go app on the host instead: `make infra`, then `make run`.
 | URL | What |
 |---|---|
 | http://localhost:8080 | Product list with cart |
-| http://localhost:8080/admin.html | Demo admin: change price / stock (opens in its own tab from the top bar) |
+| http://localhost:8080/admin.html | Demo admin: change price / on-hand stock, toggle flash sale; shows available vs. reserved (opens in its own tab from the top bar) |
 | http://localhost:8080/checkout.html?items=1:2,2:1 | Checkout page; `product_id:quantity` pairs come from the query string (`?product_id=1&qty=1` also works) |
 | http://localhost:9090 | Mock payment gateway; a separate server that simulates a third party |
 
@@ -31,10 +31,11 @@ To run the Go app on the host instead: `make infra`, then `make run`.
 | 2 | Card declined, then retry | Use card `4000 0000 0000 0002` → result page shows **付款未完成** → 重新付款 |
 | 3 | Price changed while the shopper is on the page | Open checkout, change the price in the admin tab (`/admin.html`), submit → modal lists the change, page refreshes, shopper re-confirms |
 | 4 | Not enough stock / sold out | Set stock to 1 in admin and choose qty 2, or open product 3 (sold out). With several products, the reservation is all-or-nothing: nothing is held if one item is short |
-| 5 | Last unit race | Set stock = 1, submit from two tabs → exactly one wins, the other gets an immediate **已售完** |
+| 5 | Last unit race | Set stock = 1, submit from two tabs → exactly one wins, the other gets an immediate **已售完**. Works for both flash-sale products (Valkey gate) and normal products (DB row lock) |
 | 6 | Coupons | `RETURN500` (min 3,000), `SAVE10` (10% off), `ONCE100` (single use; second order is rejected) |
 | 7 | ATM / AFTEE | Pick the method; the gateway shows a virtual account and a "simulate transfer" button |
 | 8 | Double submit | Double-click submit or retry after a network error → same `Idempotency-Key`, so only one order |
+| 8b | Reload while processing | After submit the URL gets `&draft=<id>`; reloading (or coming back with the browser's back button) resumes polling that draft instead of submitting again. If processing takes over 60s the page says "still processing" and only offers "keep checking", never a second submit |
 | 9 | Unpaid order expiry | Set `PAYMENT_TTL_SECONDS=60`, leave an order unpaid → it expires and stock is returned |
 
 ## Architecture
@@ -48,11 +49,11 @@ flowchart LR
   subgraph app[Go process]
     API[HTTP API :8080] --> SVC[App services]
     C[Kafka consumer group<br/>3 members] --> SVC
-    J[Jobs: reclaim drafts,<br/>expire unpaid orders] --> SVC
+    J[Jobs: reclaim drafts,<br/>expire unpaid orders,<br/>sync flash gates] --> SVC
   end
 
-  SVC -- source of truth --> PG[(PostgreSQL<br/>products, coupons, customers,<br/>drafts, orders, payments)]
-  SVC -- cache + stock counter --> VK[(Valkey)]
+  SVC -- source of truth --> PG[(PostgreSQL<br/>products + available_stock, reservations,<br/>coupons, customers, drafts, orders, payments)]
+  SVC -- product cache +<br/>flash-sale gate --> VK[(Valkey)]
   SVC -- checkout.requested --> K[(Kafka)]
   K --> C
   SVC -- create payment session --> GW
@@ -68,7 +69,7 @@ internal/domain/{def,model}      error codes, statuses, pricing & validation (pu
 internal/app/                    ProductService, CheckoutService, OrderService, PaymentService
 internal/app/adapter/            service input / output types
 internal/infra/database/repo     PostgreSQL (pgx)
-internal/infra/cache             product cache + stock reservation (Lua)
+internal/infra/cache             product cache + flash-sale gate (Lua)
 internal/infra/producer          Kafka producer
 internal/infra/paymentgateway    gateway client + signature verification
 internal/interfaces/web          HTTP handlers
@@ -93,9 +94,12 @@ sequenceDiagram
 
   B->>A: POST /api/checkouts (Idempotency-Key, items + prices seen, expected_total)
   A->>A: format validation
-  A->>P: insert draft (pending)
-  A->>V: Lua: reserve stock atomically
-  alt not enough stock
+  opt cart has flash-sale products
+    A->>V: Lua: take units from the gate (all-or-nothing)
+  end
+  A->>P: TX: insert draft (pending) + reserve available_stock + insert reservations
+  alt not enough stock (gate or DB)
+    A->>V: give gate units back (if taken)
     A-->>B: 409 ITEMS_CHANGED (sold out / insufficient)
   else reserved
     A->>K: publish checkout.requested {draft_id}
@@ -106,12 +110,10 @@ sequenceDiagram
   end
   K->>W: message
   W->>P: claim draft (pending → processing)
-  W->>P: TX: lock products & coupon, re-check price/stock/coupon/total,<br/>deduct stock, upsert customer, insert order, draft → completed
+  W->>P: TX: lock products & coupon, re-check price/coupon/total,<br/>deduct stock, reservation → committed, upsert customer,<br/>insert order, draft → completed
   alt rejected (price changed / coupon / amount)
-    W->>P: draft → failed (+ details)
-    W->>V: release reservation
-  else ok
-    W->>V: commit reservation, invalidate product cache
+    W->>P: TX: reservation → released, available_stock += qty, draft → failed
+    W->>V: refill flash-sale gate
   end
   B->>A: POST /api/orders/{id}/payments
   A->>G: create payment session (signed)
@@ -145,21 +147,31 @@ The client sends the unit price it displayed and the `expected_total` the shoppe
 - A failing draft never blocks a partition. It is put back to `pending`, the offset is committed, and the reclaim job re-publishes it.
 - The **draft row in Postgres is the source of truth.** If a publish fails or a worker dies, the reclaim job re-publishes drafts that are `pending` for more than 10s or `processing` for more than 60s.
 
-### 3. Fairness: who gets the last unit
-Kafka only orders messages within a partition, and with several consumers the completion order is not the submit order anyway. A single partition would kill parallelism. Instead, stock is **reserved synchronously in Valkey** with an atomic Lua script when the shopper submits:
+### 3. Stock reservation: PostgreSQL for everything, a Valkey gate for flash sales
+Kafka only orders messages within a partition, and with several consumers the completion order is not the submit order anyway; a single partition would kill parallelism. So "who gets the last unit" is decided **synchronously at submit time**, not by the queue.
 
-- `stock:{id}` = available units = DB stock − units held by in-flight drafts
-- `reservation:{draft_id}` = which units this draft holds
+Each product has two numbers:
 
-Valkey runs commands one at a time, so the first request to reach it wins, and losers get an instant "sold out" without waiting for the async pipeline. Reservations are:
+| Column | Meaning | Changes when |
+|---|---|---|
+| `stock` | on hand, not yet sold to an order | order created (−), unpaid order expired (+) |
+| `available_stock` | what shoppers can still buy = `stock` − units held by in-flight checkouts | checkout submitted (−), checkout failed or order expired (+) |
 
-- **released** when a draft fails (idempotent);
-- **committed** when the order is created;
-- **returned** to the counter when an unpaid order expires.
+**Every product.** `POST /api/checkouts` inserts the draft and runs `UPDATE products SET available_stock = available_stock - qty WHERE id = ? AND available_stock >= qty` for every item **in the same transaction**, plus a row in `inventory_reservations` (`held → committed | released`).
 
-The DB conditional update `stock >= qty` plus `CHECK (stock >= 0)` stays as the final guard against overselling. If Valkey and the DB ever disagree, the worst case is a rejected order, never an oversold one.
+- One source of truth, and no window where a draft exists without its units (or the opposite).
+- Rows are locked in product-id order, so overlapping carts cannot deadlock.
+- If one item is short the whole transaction rolls back (all-or-nothing).
+- Releasing the units and marking the draft failed are also one transaction.
+- `CHECK (available_stock >= 0 AND available_stock <= stock)` guarantees no overselling.
 
-The draft is written before the reservation is taken. If the process crashes between the two, the draft is still processed safely by the DB guard; with the opposite order, reserved units could leak.
+**Flash-sale products** (`products.flash_sale`). Thousands of shoppers updating the *same row* would queue on its row lock, hold DB connections, and slow down the whole database. So these items first pass a **Valkey gate** (`gate:{id}`, atomic all-or-nothing Lua decrement):
+
+- Only about `available_stock` requests ever reach the DB; the rest get an instant "sold out".
+- The gate is a **load shedder, not the source of truth**. If it drifts (a crash between gate and DB, a Valkey restart), the worst case is rejecting a few shoppers early or letting a few extra requests through to the DB, which rejects them. It can never oversell.
+- A job realigns every gate with `available_stock` every 30s, and on startup. If Valkey is down, the gate fails open and the DB decides.
+
+Why not Valkey for everything? It would mean two sources of truth to reconcile on every path (crash windows, restarts, drift). That cost is only worth paying for the few hot products where row-lock contention is the real bottleneck.
 
 ### 4. DB + cache writes for product updates
 `PUT /api/admin/products/{id}`:
@@ -179,11 +191,13 @@ So "DB and cache both succeed, or nothing changes". Reads use cache-aside.
 ### 6. Idempotent submit
 The browser sends an `Idempotency-Key` per confirmed payload. A replay with the same key returns the same draft and does not reserve stock again.
 
+Once the server accepts a checkout, the page writes the `draft_id` into its URL. A reload, the back button from the payment page, or a 60s polling timeout all resume **the same draft**: the page never offers a second submit while a draft is in flight, because that would create a second order and a second reservation. When a resumed draft is already completed, the page goes to the order page rather than silently opening a new payment session.
+
 ## API
 
 | Method | Path | Notes |
 |---|---|---|
-| GET | `/api/products`, `/api/products/{id}` | stock = available (excludes reserved units) |
+| GET | `/api/products`, `/api/products/{id}` | `available_stock` = what can be bought; `stock` = on hand; `flash_sale` |
 | GET | `/api/checkout/options` | shipping regions & fees, payment methods |
 | POST | `/api/coupons/preview` | `{code, subtotal}` → discount (display only) |
 | POST | `/api/checkouts` | header `Idempotency-Key`; returns `202 {draft_id}` or `400` / `409` |
@@ -191,16 +205,17 @@ The browser sends an `Idempotency-Key` per confirmed payload. A replay with the 
 | GET | `/api/orders/{id}` | order + latest payment status |
 | POST | `/api/orders/{id}/payments` | creates or reuses a gateway session → `{payment_url}` |
 | POST | `/api/payments/callback` | gateway → shop, `X-Signature` header |
-| PUT | `/api/admin/products/{id}` | demo only, no auth: `{price?, stock?}` |
+| PUT | `/api/admin/products/{id}` | demo only, no auth: `{price?, stock?, flash_sale?}`; changing `stock` moves `available_stock` by the same delta |
 
 Errors look like `{"error": {"code": "ITEMS_CHANGED", "message": "...", "details": {...}}}`.
 
 ## Known limitations / next steps
 
 - **No auth.** Order ids are UUIDs, but `GET /api/orders/{id}` should check ownership (IDOR); the admin API needs auth.
-- **Product cache race.** A reader could write a stale product after a writer updates it. A fix is a version-guarded `SET` (Lua comparing `version`). Correctness is unaffected because price and stock are re-checked in the DB transaction.
-- **Rebuilding the stock counter** after a Valkey data loss uses `DB stock − in-flight drafts`. A periodic reconciliation job would also catch drift.
-- **Valkey Cluster.** The multi-key Lua scripts would need hash tags such as `{product}` to keep keys in one slot.
+- **Product cache race.** A reader could write a stale product after a writer updates it. A fix is a version-guarded `SET` (Lua comparing `version`). Correctness is unaffected: price is re-checked in the DB transaction, and stock is never served from the cache.
+- **Reservation timeout.** A held reservation lives until its draft completes or fails (the reclaim job keeps retrying). Adding `expires_at` to `inventory_reservations` would also cap how long units can be held.
+- **Display stock under extreme load.** Product pages read stock from the DB (MVCC reads never wait on locks). At flash-sale scale they could read the gate counter instead.
+- **Valkey Cluster.** The multi-key gate script would need hash tags such as `{gate}` to keep keys in one slot.
 - **Outbox pattern.** Publishing after the draft insert relies on the reclaim job. An outbox table, or CDC with Debezium, makes it exactly-once-publish.
 - **Notifications.** Emit `order.created` and `order.paid` events for email, invoice, and fulfilment as separate consumer groups.
 - **Observability.** Add metrics (draft latency, queue lag, payment success rate) and tracing across the API, Kafka, and worker.

@@ -32,7 +32,8 @@ type PlaceOrderParams struct {
 }
 
 // PlaceOrder creates the order in a single transaction:
-// lock products -> validate & price -> deduct stock -> consume coupon -> upsert customer -> insert order -> complete draft.
+// lock products -> validate & price -> deduct stock -> commit reservation -> consume coupon -> upsert customer
+// -> insert order -> complete draft.
 func (r *OrderRepo) PlaceOrder(ctx context.Context, p PlaceOrderParams) (model.Order, error) {
 	req := p.Draft.Request
 	tx, err := r.pool.Begin(ctx)
@@ -79,6 +80,12 @@ func (r *OrderRepo) PlaceOrder(ctx context.Context, p PlaceOrderParams) (model.O
 		if tag.RowsAffected() == 0 {
 			return model.Order{}, def.NewError(def.ErrItemsChanged, "商品庫存不足")
 		}
+	}
+	// available_stock was already deducted when the draft reserved; the reservation now belongs to the order.
+	if _, err := tx.Exec(ctx, `
+		UPDATE inventory_reservations SET status = $2, updated_at = now() WHERE draft_id = $1 AND status = $3`,
+		p.Draft.ID, reservationCommitted, reservationHeld); err != nil {
+		return model.Order{}, fmt.Errorf("commit reservation: %w", err)
 	}
 	if coupon != nil {
 		if _, err := tx.Exec(ctx, "UPDATE coupons SET used_count = used_count + 1 WHERE code = $1", coupon.Code); err != nil {
@@ -175,14 +182,10 @@ func (r *OrderRepo) Get(ctx context.Context, id string) (*model.Order, error) {
 	return &o, rows.Err()
 }
 
-type RestockedLine struct {
-	ProductID int64
-	Quantity  int
-}
-
-// ExpireOverdue expires unpaid orders past their deadline, restores DB stock and coupon usage.
-// Returns the restored lines so the caller can give the units back to the Valkey stock counter.
-func (r *OrderRepo) ExpireOverdue(ctx context.Context, limit int) ([]string, []RestockedLine, error) {
+// ExpireOverdue expires unpaid orders past their deadline and gives their units back to stock and
+// available_stock (sellable again), plus coupon usage. Returns the restocked lines so the caller can
+// also refill the Valkey flash-sale gate.
+func (r *OrderRepo) ExpireOverdue(ctx context.Context, limit int) ([]string, []StockLine, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("begin tx: %w", err)
@@ -213,7 +216,7 @@ func (r *OrderRepo) ExpireOverdue(ctx context.Context, limit int) ([]string, []R
 	}
 
 	var ids []string
-	var restocked []RestockedLine
+	var restocked []StockLine
 	for _, o := range orders {
 		if _, err := tx.Exec(ctx, "UPDATE orders SET status = $2, updated_at = now() WHERE id = $1", o.id, def.OrderStatusExpired); err != nil {
 			return nil, nil, fmt.Errorf("expire order: %w", err)
@@ -223,16 +226,17 @@ func (r *OrderRepo) ExpireOverdue(ctx context.Context, limit int) ([]string, []R
 			return nil, nil, fmt.Errorf("expire payments: %w", err)
 		}
 		lineRows, err := tx.Query(ctx, `
-			UPDATE products p SET stock = p.stock + oi.quantity, version = p.version + 1, updated_at = now()
+			UPDATE products p
+			   SET stock = p.stock + oi.quantity, available_stock = p.available_stock + oi.quantity, updated_at = now()
 			  FROM order_items oi
 			 WHERE oi.order_id = $1 AND p.id = oi.product_id
-			RETURNING p.id, oi.quantity`, o.id)
+			RETURNING p.id, oi.quantity, p.flash_sale`, o.id)
 		if err != nil {
 			return nil, nil, fmt.Errorf("restore stock: %w", err)
 		}
 		for lineRows.Next() {
-			var l RestockedLine
-			if err := lineRows.Scan(&l.ProductID, &l.Quantity); err != nil {
+			var l StockLine
+			if err := lineRows.Scan(&l.ProductID, &l.Quantity, &l.FlashSale); err != nil {
 				lineRows.Close()
 				return nil, nil, err
 			}

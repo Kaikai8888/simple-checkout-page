@@ -8,16 +8,23 @@
 </head>
 <body>
 <div class="topbar"><a href="/">Demo 後台</a><span class="sub">調整商品價格 / 庫存</span><a class="nav" href="/">商品列表</a></div>
-<div class="container" style="max-width:860px">
+<div class="container" style="max-width:960px">
   <div class="hint">開著結帳頁，在這裡改價格或庫存，再回到結帳頁送出訂單，就能示範「價格變動 / 庫存不足」的流程。
-    更新會先寫 DB，在 commit 前同步 Valkey cache，兩者都成功才算成功。</div>
+    更新會先寫 DB，在 commit 前同步 Valkey（商品 cache 與搶購閘門），兩者都成功才算成功。</div>
   <div class="panel" style="margin-top:12px;overflow-x:auto">
     <table>
-      <thead><tr><th>ID</th><th>商品</th><th>類型</th><th>價格</th><th>可售庫存</th><th></th></tr></thead>
+      <thead>
+        <tr><th>ID</th><th>商品</th><th>類型</th><th>價格</th><th>實際庫存</th><th>可售</th><th>結帳中預留</th><th>限量搶購</th><th></th></tr>
+      </thead>
       <tbody id="admin"></tbody>
     </table>
   </div>
   <p class="muted" id="msg"></p>
+  <div class="muted" style="line-height:1.8">
+    <b>實際庫存</b>：尚未成為訂單的庫存（建立訂單時扣除）。修改時，「可售」會跟著同樣幅度調整，結帳中預留的數量不受影響。<br>
+    <b>可售</b>：顧客還能買的數量 ＝ 實際庫存 − 結帳中預留。送出訂單時在 PostgreSQL 直接扣這個欄位。<br>
+    <b>限量搶購</b>：打勾的商品，送出訂單時會先經過 Valkey 閘門，擋掉超額的流量，避免大量請求同時搶同一列 DB 資料。
+  </div>
 </div>
 <script src="/common.js"></script>
 <script>
@@ -32,17 +39,24 @@
         <td class="muted">${p.is_addon ? '加購' : '主商品'}</td>
         <td><input type="number" min="0" id="price-${p.id}" value="${p.price}"></td>
         <td><input type="number" min="0" id="stock-${p.id}" value="${p.stock}"></td>
+        <td>${p.available_stock}</td>
+        <td>${p.stock - p.available_stock}</td>
+        <td><input type="checkbox" id="flash-${p.id}" ${p.flash_sale ? 'checked' : ''}></td>
         <td><button class="btn btn-ghost btn-small" onclick="save(${p.id})">更新</button></td>
       </tr>`).join('');
   }
 
   async function save(id) {
-    const price = Number(document.getElementById(`price-${id}`).value);
-    const stock = Number(document.getElementById(`stock-${id}`).value);
+    const body = {
+      price: Number(document.getElementById(`price-${id}`).value),
+      stock: Number(document.getElementById(`stock-${id}`).value),
+      flash_sale: document.getElementById(`flash-${id}`).checked,
+    };
     const msg = document.getElementById('msg');
     try {
-      const p = await api.put(`/api/admin/products/${id}`, { price, stock });
-      msg.textContent = `✔ 已更新 #${p.id} ${p.name}：${money(p.price)}，可售 ${p.stock}（${new Date().toLocaleTimeString()}）`;
+      const p = await api.put(`/api/admin/products/${id}`, body);
+      msg.textContent = `✔ 已更新 #${p.id} ${p.name}：${money(p.price)}，實際庫存 ${p.stock}，可售 ${p.available_stock}` +
+        `${p.flash_sale ? '，限量搶購' : ''}（${new Date().toLocaleTimeString()}）`;
       await load();
     } catch (err) {
       msg.textContent = `✘ 更新失敗：${err.message}`;

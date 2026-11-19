@@ -1,6 +1,7 @@
 // Checkout page.
 //   /checkout.html?items=1:2,2:1        (product_id:quantity, comma separated)
 //   /checkout.html?product_id=1&qty=1   (single product, still supported)
+//   &draft=<draft_id>                   (added after submit: a reload resumes polling instead of re-submitting)
 const $ = (id) => document.getElementById(id);
 const MAX_QTY = 10;
 const MAX_ADDON_QTY = 5;
@@ -15,6 +16,7 @@ const state = {
   coupon: null,        // { code, discount, description }
   submitting: false,
   idem: null,          // { key, body } reused only when re-sending the exact same payload (network retry)
+  draftId: null,       // submitted checkout we are waiting for; kept in the URL so a reload never re-submits
 };
 
 init();
@@ -38,6 +40,12 @@ async function init() {
   bindEvents();
   recalc();
   $('checkout').classList.remove('hidden');
+
+  const draftId = new URLSearchParams(location.search).get('draft');
+  if (draftId) {
+    state.draftId = draftId;
+    waitForDraft({ resumed: true });
+  }
 }
 
 function parseCartFromUrl() {
@@ -59,7 +67,8 @@ function parseCartFromUrl() {
 
 function syncUrl() {
   const items = state.cart.map((c) => `${c.id}:${c.qty}`).join(',');
-  history.replaceState(null, '', items ? `?items=${items}` : location.pathname);
+  const query = [items && `items=${items}`, state.draftId && `draft=${encodeURIComponent(state.draftId)}`].filter(Boolean).join('&');
+  history.replaceState(null, '', query ? `?${query}` : location.pathname);
   try { localStorage.setItem('cart', JSON.stringify(Object.fromEntries(state.cart.map((c) => [c.id, c.qty])))); } catch (_) { /* optional */ }
 }
 
@@ -83,7 +92,7 @@ function renderItems() {
   const missing = state.missing.length ? `<div class="muted danger">商品 #${state.missing.join(', #')} 已下架，已從清單移除</div>` : '';
   $('items').innerHTML = missing + state.cart.map(({ id, qty }) => {
     const p = state.catalog[id];
-    const max = Math.min(p.stock, MAX_QTY);
+    const max = Math.min(p.available_stock, MAX_QTY);
     const badge = discountLabel(p.price, p.original_price);
     const opts = max > 0
       ? Array.from({ length: max }, (_, i) => `<option value="${i + 1}" ${qty === i + 1 ? 'selected' : ''}>${i + 1}</option>`).join('')
@@ -95,13 +104,13 @@ function renderItems() {
          </details>`
       : '';
     return `
-      <div class="item ${p.stock <= 0 ? 'soldout' : ''}">
+      <div class="item ${p.available_stock <= 0 ? 'soldout' : ''}">
         <div class="cover thumb ${p.id === 1 ? '' : 'alt'}">${escapeHtml(p.name.slice(0, 8))}</div>
         <div class="item-body">
           <div class="item-name">${escapeHtml(p.name)}</div>
           <div class="price-row"><span class="price money">${money(p.price)}</span>${badge ? `<span class="badge">${badge}</span>` : ''}</div>
           ${p.original_price > p.price ? `<div class="orig">預定售價 <s>${money(p.original_price)}</s></div>` : ''}
-          <div class="stock-row"><span class="stock-tag ${p.stock > 20 ? 'ok' : ''}">${p.stock > 0 ? `剩餘 ${p.stock} 份` : '已售完'}</span></div>
+          <div class="stock-row"><span class="stock-tag ${p.available_stock > 20 ? 'ok' : ''}">${p.available_stock > 0 ? `剩餘 ${p.available_stock} 份` : '已售完'}</span>${p.flash_sale ? '<span class="flash-tag">⚡ 限量搶購</span>' : ''}</div>
           <div class="qty">數量 <select data-item-qty="${id}" ${max <= 0 ? 'disabled' : ''}>${opts}</select>
             <button type="button" class="link-btn" data-remove="${id}">移除</button></div>
           ${details}
@@ -118,12 +127,12 @@ function renderAddons() {
   }
   $('addons').innerHTML = state.addons.map((a) => {
     const qty = state.addonQty[a.id] || 0;
-    const max = Math.min(a.stock, MAX_ADDON_QTY);
+    const max = Math.min(a.available_stock, MAX_ADDON_QTY);
     const opts = Array.from({ length: Math.max(max, 1) }, (_, i) => `<option value="${i + 1}" ${qty === i + 1 ? 'selected' : ''}>${i + 1}</option>`).join('');
     return `
       <div class="addon">
-        <input type="checkbox" data-addon="${a.id}" ${qty > 0 ? 'checked' : ''} ${a.stock <= 0 ? 'disabled' : ''}>
-        <div class="name">${escapeHtml(a.name)}<div class="muted">${money(a.price)}・${a.stock > 0 ? `剩 ${a.stock} 件` : '已售完'}</div></div>
+        <input type="checkbox" data-addon="${a.id}" ${qty > 0 ? 'checked' : ''} ${a.available_stock <= 0 ? 'disabled' : ''}>
+        <div class="name">${escapeHtml(a.name)}<div class="muted">${money(a.price)}・${a.available_stock > 0 ? `剩 ${a.available_stock} 件` : '已售完'}</div></div>
         <select data-addon-qty="${a.id}" ${qty > 0 ? '' : 'disabled'}>${opts}</select>
       </div>`;
   }).join('');
@@ -172,7 +181,7 @@ function onCountyChange(defaultDistrict) {
 
 function mainItems() {
   return state.cart
-    .filter((c) => c.qty > 0 && state.catalog[c.id]?.stock > 0)
+    .filter((c) => c.qty > 0 && state.catalog[c.id]?.available_stock > 0)
     .map((c) => ({ product_id: c.id, quantity: c.qty, unit_price: state.catalog[c.id].price }));
 }
 
@@ -300,6 +309,7 @@ function bindEvents() {
     $('invoice-personal').classList.toggle('hidden', company);
   }));
   $('changed-ok').addEventListener('click', () => $('changed').classList.add('hidden'));
+  $('overlay-retry').addEventListener('click', () => waitForDraft({ resumed: false }));
   $('form').addEventListener('submit', submit);
 }
 
@@ -373,15 +383,47 @@ async function submit(e) {
     return handleCheckoutError(err);
   }
   state.idem = null;
+  state.draftId = draft.draft_id;
+  syncUrl(); // from now on a reload resumes this draft instead of submitting a new one
+  return waitForDraft({ resumed: false });
+}
 
-  showOverlay('訂單處理中，請勿關閉視窗…');
-  const result = await pollDraft(draft.draft_id);
-  if (result.status === 'completed') return goPay(result.order_id);
+// Polls the submitted draft until it is completed / failed. On timeout the shopper is NOT allowed to submit
+// again (that could create a second order); they can only keep waiting for the same draft.
+async function waitForDraft({ resumed }) {
+  setSubmitting(true);
+  showOverlay(resumed ? '正在查詢您剛送出的訂單…' : '訂單處理中，請勿關閉視窗…');
+  const result = await pollDraft(state.draftId);
 
+  if (result.status === 'completed') {
+    // Fresh submit: go straight to payment. Resumed (reload / back button): show the order page,
+    // which offers "pay" or "retry payment" without silently opening a new payment session.
+    if (resumed) {
+      showOverlay('訂單已成立，正在前往訂單頁…');
+      location.href = `/result.html?order_id=${encodeURIComponent(result.order_id)}`;
+      return;
+    }
+    return goPay(result.order_id);
+  }
+  if (result.status === 'timeout') return showStillProcessing();
+
+  clearDraft();
   hideOverlay();
   setSubmitting(false);
   if (result.status === 'failed') return handleCheckoutError(result.error);
-  showErrors(['訂單處理時間較長，請稍後重新整理頁面確認。']);
+  showErrors(['找不到這筆結帳紀錄，請確認購物內容後重新送出。']);
+}
+
+function showStillProcessing() {
+  $('overlay-spinner').classList.add('hidden');
+  $('overlay-text').textContent = '訂單仍在處理中';
+  $('overlay-sub').textContent = '系統目前較忙碌。您的訂單已送出，請勿重新下單；重新整理或稍後回到此頁面，也會繼續查詢同一筆訂單。';
+  $('overlay-actions').classList.remove('hidden');
+}
+
+function clearDraft() {
+  state.draftId = null;
+  syncUrl();
 }
 
 async function pollDraft(draftId) {
@@ -389,9 +431,12 @@ async function pollDraft(draftId) {
   for (let i = 0; Date.now() - started < 60_000; i++) {
     await sleep(i < 5 ? 300 : 1000);
     try {
-      const d = await api.get(`/api/checkouts/${draftId}`);
+      const d = await api.get(`/api/checkouts/${encodeURIComponent(draftId)}`);
       if (d.status === 'completed' || d.status === 'failed') return d;
-    } catch (_) { /* transient, keep polling */ }
+    } catch (err) {
+      if (err.status === 404) return { status: 'not_found' };
+      /* transient (network / 5xx): keep polling */
+    }
     $('overlay-sub').textContent = `已等待 ${Math.round((Date.now() - started) / 1000)} 秒`;
   }
   return { status: 'timeout' };
@@ -451,11 +496,11 @@ async function refreshAfterChange(issues, desc) {
 
 function clampQuantities() {
   for (const c of state.cart) {
-    const stock = state.catalog[c.id].stock;
+    const stock = state.catalog[c.id].available_stock;
     c.qty = stock > 0 ? Math.max(1, Math.min(c.qty, stock, MAX_QTY)) : 0;
   }
   for (const a of state.addons) {
-    if (state.addonQty[a.id]) state.addonQty[a.id] = Math.min(state.addonQty[a.id], a.stock, MAX_ADDON_QTY);
+    if (state.addonQty[a.id]) state.addonQty[a.id] = Math.min(state.addonQty[a.id], a.available_stock, MAX_ADDON_QTY);
   }
 }
 
@@ -466,7 +511,13 @@ function newKey() {
 }
 function updateSubmitState() { $('submit').disabled = state.submitting || mainItems().length === 0; }
 function setSubmitting(v) { state.submitting = v; updateSubmitState(); }
-function showOverlay(text) { $('overlay-text').textContent = text; $('overlay-sub').textContent = ''; $('overlay').classList.remove('hidden'); }
+function showOverlay(text) {
+  $('overlay-text').textContent = text;
+  $('overlay-sub').textContent = '';
+  $('overlay-spinner').classList.remove('hidden');
+  $('overlay-actions').classList.add('hidden');
+  $('overlay').classList.remove('hidden');
+}
 function hideOverlay() { $('overlay').classList.add('hidden'); }
 function showErrors(list) {
   $('form-errors').innerHTML = `<b>請確認以下資訊</b><ul>${list.map((e) => `<li>${escapeHtml(e)}</li>`).join('')}</ul>`;

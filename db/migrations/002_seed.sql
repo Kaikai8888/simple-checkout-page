@@ -11,6 +11,9 @@ INSERT INTO products (id, name, description, highlights, image_url, price, origi
 (101, '加購：《一九四五》電影海報', '集資限定版', ARRAY[]::TEXT[], '', 300, 400, 50, TRUE),
 (102, '加購：空襲標記金屬幣', '正反面設計，數量有限', ARRAY[]::TEXT[], '', 150, 200, 3, TRUE);
 
+UPDATE products SET available_stock = stock;
+UPDATE products SET flash_sale = TRUE WHERE id = 1; -- limited bundle: demo of the Valkey flash-sale gate
+
 SELECT setval('products_id_seq', 1000);
 
 INSERT INTO coupons (code, description, discount_type, value, min_subtotal, usage_limit) VALUES

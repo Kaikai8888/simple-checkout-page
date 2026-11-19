@@ -41,8 +41,9 @@ type CouponPreviewOutput struct {
 }
 
 type UpdateProductInput struct {
-	Price *int64 `json:"price"`
-	Stock *int   `json:"stock"`
+	Price     *int64 `json:"price"`
+	Stock     *int   `json:"stock"`
+	FlashSale *bool  `json:"flash_sale"`
 }
 
 type PaymentView struct {

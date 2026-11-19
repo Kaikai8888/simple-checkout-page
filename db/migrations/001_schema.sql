@@ -7,7 +7,12 @@ CREATE TABLE products (
     image_url      TEXT        NOT NULL DEFAULT '',
     price          BIGINT      NOT NULL CHECK (price >= 0),
     original_price BIGINT      NOT NULL DEFAULT 0,
-    stock          INT         NOT NULL CHECK (stock >= 0), -- DB constraint is the last line of defence against overselling
+    -- stock:           units on hand that are not yet sold to an order (deducted when an order is created)
+    -- available_stock: units a shopper can still reserve = stock - units held by in-flight checkouts
+    -- CHECK constraints are the last line of defence against overselling.
+    stock           INT         NOT NULL CHECK (stock >= 0),
+    available_stock INT         NOT NULL DEFAULT 0 CHECK (available_stock >= 0 AND available_stock <= stock),
+    flash_sale      BOOLEAN     NOT NULL DEFAULT FALSE, -- hot product: put the Valkey gate in front of the DB
     is_addon       BOOLEAN     NOT NULL DEFAULT FALSE,
     version        BIGINT      NOT NULL DEFAULT 1,
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -49,6 +54,18 @@ CREATE TABLE checkout_drafts (
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_checkout_drafts_status_updated ON checkout_drafts (status, updated_at);
+
+-- Stock held by a checkout draft. held -> committed (order created) | released (checkout failed)
+CREATE TABLE inventory_reservations (
+    draft_id   TEXT        NOT NULL REFERENCES checkout_drafts (id),
+    product_id BIGINT      NOT NULL REFERENCES products (id),
+    quantity   INT         NOT NULL CHECK (quantity > 0),
+    status     TEXT        NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (draft_id, product_id)
+);
+CREATE INDEX idx_inventory_reservations_held ON inventory_reservations (product_id) WHERE status = 'held';
 
 CREATE TABLE orders (
     id             TEXT PRIMARY KEY,

@@ -42,8 +42,12 @@ func NewCheckoutService(drafts *repo.DraftRepo, orders *repo.OrderRepo, coupons 
 		producer: p, paymentTTL: paymentTTL, now: time.Now}
 }
 
-// Submit validates the format, persists a draft, reserves stock in Valkey and publishes to Kafka.
+// Submit validates the format, reserves stock and persists a draft, then publishes to Kafka.
 // Order creation itself happens asynchronously in ProcessDraft.
+//
+// Stock reservation is hybrid:
+//  1. flash-sale items first pass the Valkey gate (sheds excess traffic before it reaches the hot DB row)
+//  2. every item is reserved from products.available_stock in the same DB transaction that inserts the draft
 func (s *CheckoutService) Submit(ctx context.Context, idempotencyKey string, in adapter.SubmitCheckoutInput) (adapter.SubmitCheckoutOutput, error) {
 	idempotencyKey = strings.TrimSpace(idempotencyKey)
 	if idempotencyKey == "" || len(idempotencyKey) > 128 {
@@ -61,25 +65,24 @@ func (s *CheckoutService) Submit(ctx context.Context, idempotencyKey string, in 
 		return adapter.SubmitCheckoutOutput{DraftID: existing.ID, Status: existing.Status}, nil
 	}
 
-	draftID, created, err := s.drafts.Create(ctx, uuid.NewString(), idempotencyKey, req)
+	products, err := s.products.GetProducts(ctx, req.ProductIDs())
+	if err != nil {
+		return adapter.SubmitCheckoutOutput{}, err
+	}
+	taken, err := s.products.PassFlashGate(ctx, req.Items, products)
+	if err != nil {
+		return adapter.SubmitCheckoutOutput{}, err // sold out at the gate: the DB was never touched
+	}
+
+	draftID, created, err := s.drafts.CreateWithReservation(ctx, uuid.NewString(), idempotencyKey, req)
+	if err != nil || !created {
+		s.products.ReturnToGate(ctx, taken) // DB said no (or duplicate request): give the gate units back
+	}
 	if err != nil {
 		return adapter.SubmitCheckoutOutput{}, err
 	}
 	if !created {
 		return adapter.SubmitCheckoutOutput{DraftID: draftID, Status: def.DraftStatusPending}, nil
-	}
-
-	// Draft first, reserve second: if we crash in between, the draft is still processed and the DB
-	// conditional update protects stock (we may under-reserve, but never oversell or leak units).
-	if err := s.products.ReserveStock(ctx, draftID, req.Items); err != nil {
-		appErr, ok := def.AsAppError(err)
-		if !ok {
-			appErr = def.NewError(def.ErrInternal, "庫存預留失敗，請稍後再試")
-		}
-		if markErr := s.drafts.MarkFailed(ctx, draftID, appErr); markErr != nil {
-			slog.ErrorContext(ctx, "mark draft failed", "draft_id", draftID, "err", markErr)
-		}
-		return adapter.SubmitCheckoutOutput{}, appErr
 	}
 
 	if err := s.producer.PublishCheckoutRequested(ctx, draftID); err != nil {
@@ -135,7 +138,6 @@ func (s *CheckoutService) ProcessDraft(ctx context.Context, draftID string) erro
 		},
 	})
 	if err == nil {
-		s.products.CommitStock(ctx, draft.ID, draft.Request.ProductIDs())
 		slog.InfoContext(ctx, "order created", "draft_id", draft.ID, "order_id", order.ID, "total", order.Total)
 		return nil
 	}
@@ -191,12 +193,12 @@ func (s *CheckoutService) PreviewCoupon(ctx context.Context, in adapter.CouponPr
 
 func (s *CheckoutService) fail(ctx context.Context, draft *model.CheckoutDraft, appErr *def.AppError) error {
 	slog.InfoContext(ctx, "checkout rejected", "draft_id", draft.ID, "code", appErr.Code)
-	// Release first so that once the shopper sees "failed", the units are already available again.
-	// If MarkFailed then fails, the draft is reclaimed and re-processed; the DB guard still prevents overselling.
-	s.products.ReleaseStock(ctx, draft.ID)
-	if err := s.drafts.MarkFailed(ctx, draft.ID, appErr); err != nil {
-		return fmt.Errorf("mark draft failed: %w", err)
+	// Releasing the reservation and failing the draft happen in one DB transaction.
+	lines, err := s.drafts.ReleaseAndFail(ctx, draft.ID, appErr)
+	if err != nil {
+		return fmt.Errorf("release and fail draft: %w", err)
 	}
+	s.products.ReturnLinesToGate(ctx, lines)
 	return nil
 }
 

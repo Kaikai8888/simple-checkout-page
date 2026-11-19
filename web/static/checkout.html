@@ -108,9 +108,13 @@
 <!-- processing overlay -->
 <div id="overlay" class="overlay hidden">
   <div class="modal center">
-    <div class="spinner"></div>
+    <div class="spinner" id="overlay-spinner"></div>
     <div id="overlay-text">訂單處理中，請勿關閉視窗…</div>
     <div class="muted" id="overlay-sub"></div>
+    <div id="overlay-actions" class="hidden">
+      <button type="button" class="btn btn-primary" id="overlay-retry">繼續查詢</button>
+      <a class="muted" href="/" style="display:inline-block;margin-top:12px">先回商品列表</a>
+    </div>
   </div>
 </div>
 

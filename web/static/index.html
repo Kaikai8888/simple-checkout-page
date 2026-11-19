@@ -60,14 +60,14 @@
   async function load() {
     ({ products } = await api.get('/api/products'));
     document.getElementById('cards').innerHTML = products.filter((p) => !p.is_addon).map((p) => {
-      const max = Math.min(p.stock, 10);
+      const max = Math.min(p.available_stock, 10);
       return `
       <div class="panel">
         <div class="cover ${p.id === 1 ? '' : 'alt'}">${escapeHtml(p.name.length <= 6 ? p.name : p.name.slice(0, 8))}</div>
         <div class="product-name">${escapeHtml(p.name)}</div>
         <div class="price-row"><span class="price">${money(p.price)}</span>
           ${discountLabel(p.price, p.original_price) ? `<span class="badge">${discountLabel(p.price, p.original_price)}</span>` : ''}</div>
-        <div class="stock-row"><span class="stock-tag ${p.stock > 20 ? 'ok' : ''}">${p.stock > 0 ? `剩餘 ${p.stock} 份` : '已售完'}</span></div>
+        <div class="stock-row"><span class="stock-tag ${p.available_stock > 20 ? 'ok' : ''}">${p.available_stock > 0 ? `剩餘 ${p.available_stock} 份` : '已售完'}</span>${p.flash_sale ? '<span class="flash-tag">⚡ 限量搶購</span>' : ''}</div>
         <div class="card-actions">
           <select id="qty-${p.id}" style="width:72px" ${max <= 0 ? 'disabled' : ''}>
             ${max > 0 ? Array.from({ length: max }, (_, i) => `<option>${i + 1}</option>`).join('') : '<option>0</option>'}

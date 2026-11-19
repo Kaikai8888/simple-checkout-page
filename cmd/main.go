@@ -70,7 +70,7 @@ func run() error {
 	gatewayClient := paymentgateway.NewClient(cfg.GatewayApiUrl, cfg.GatewayApiKey, cfg.GatewaySecret)
 
 	// ---- app ----
-	productSvc := app.NewProductService(productRepo, draftRepo, cache.NewProductCache(valkey), cache.NewStockStore(valkey))
+	productSvc := app.NewProductService(productRepo, cache.NewProductCache(valkey), cache.NewFlashSaleGate(valkey))
 	checkoutSvc := app.NewCheckoutService(draftRepo, orderRepo, couponRepo, productSvc, checkoutProducer, cfg.PaymentTTL)
 	orderSvc := app.NewOrderService(orderRepo, paymentRepo, productSvc)
 	paymentSvc := app.NewPaymentService(orderRepo, paymentRepo, gatewayClient, cfg.AppPublicUrl, cfg.AppInternalUrl)
@@ -104,7 +104,7 @@ func run() error {
 	start("consumer", func() {
 		consumer.NewCheckoutConsumer(checkoutSvc, cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroupID, cfg.ConsumerCount).Run(ctx)
 	})
-	start("scheduler", func() { job.NewScheduler(checkoutSvc, orderSvc).Run(ctx) })
+	start("scheduler", func() { job.NewScheduler(checkoutSvc, orderSvc, productSvc).Run(ctx) })
 
 	slog.Info("checkout system is up", "shop", cfg.AppPublicUrl, "gateway", cfg.GatewayPublicUrl)
 	<-ctx.Done()

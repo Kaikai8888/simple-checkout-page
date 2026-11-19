@@ -27,7 +27,7 @@ call() {
 }
 
 set_product() { call PUT "/api/admin/products/$1" "{\"price\":$2,\"stock\":$3}"; }
-stock_of()    { call GET "/api/products/$1"; jq -r .stock <<<"$BODY"; }
+stock_of()    { call GET "/api/products/$1"; jq -r .available_stock <<<"$BODY"; }
 key()         { echo "smoke-$(date +%s)-$RANDOM$RANDOM"; }
 
 # payload ITEMS_JSON EXPECTED_TOTAL [COUPON] [PAYMENT_METHOD] [PHONE]
@@ -104,13 +104,20 @@ check "current price returned" "$(jq -r '.error.details.items[0].current_price' 
 check "reservation released (stock back to 10)" "$(stock_of 1)" 10
 set_product 1 5500 10 >/dev/null
 
-title "4. insufficient stock is rejected synchronously"
+title "4. insufficient stock is rejected synchronously (product 1 = flash sale, rejected by the Valkey gate)"
 set_product 1 5500 1 >/dev/null
 submit "$(payload '[{"product_id":1,"quantity":2,"unit_price":5500}]' 11000)"
 check "HTTP 409" "$STATUS" 409
 check "reason" "$(jq -r '.error.details.items[0].reason' <<<"$BODY")" INSUFFICIENT_STOCK
 
-title "5. two shoppers race for the last unit"
+title "4b. insufficient stock on a normal product (rejected by the DB available_stock update)"
+set_product 2 1980 1 >/dev/null
+submit "$(payload '[{"product_id":2,"quantity":2,"unit_price":1980}]' 3960)"
+check "HTTP 409" "$STATUS" 409
+check "reason" "$(jq -r '.error.details.items[0].reason' <<<"$BODY")" INSUFFICIENT_STOCK
+check "available stock unchanged" "$(stock_of 2)" 1
+
+title "5. two shoppers race for the last unit (flash sale product, Valkey gate)"
 set_product 1 5500 1 >/dev/null
 P=$(payload '[{"product_id":1,"quantity":1,"unit_price":5500}]' 5500)
 for i in 1 2; do
@@ -122,6 +129,18 @@ check "exactly one accepted" "$(grep -c 202 "${TMPDIR:-/tmp}/race.txt")" 1
 check "exactly one sold out" "$(grep -c 409 "${TMPDIR:-/tmp}/race.txt")" 1
 sleep 2
 check "available stock is 0" "$(stock_of 1)" 0
+
+title "5b. two shoppers race for the last unit (normal product, DB row lock)"
+set_product 2 1980 1 >/dev/null
+P=$(payload '[{"product_id":2,"quantity":1,"unit_price":1980}]' 1980)
+for i in 1 2; do
+  curl -s -m 10 -o /dev/null -w '%{http_code}\n' -X POST "$BASE/api/checkouts" -H 'Content-Type: application/json' \
+    -H "Idempotency-Key: $(key)-$i" -d "$P" &
+done > "${TMPDIR:-/tmp}/race2.txt"
+wait
+check "exactly one accepted" "$(grep -c 202 "${TMPDIR:-/tmp}/race2.txt")" 1
+check "exactly one sold out" "$(grep -c 409 "${TMPDIR:-/tmp}/race2.txt")" 1
+check "available stock is 0" "$(stock_of 2)" 0
 
 title "6. coupons"
 set_product 1 5500 10 >/dev/null
@@ -173,13 +192,24 @@ check "order paid" "$(jq -r .status <<<"$BODY")" paid
 check "3 order lines" "$(jq -r '.lines | length' <<<"$BODY")" 3
 check "total" "$(jq -r .total <<<"$BODY")" 17240
 
-title "13. one item short -> nothing is reserved (all-or-nothing)"
+title "13. one item short -> nothing is reserved (all-or-nothing, short item behind the flash gate)"
 set_product 1 5500 1 >/dev/null
 submit "$(payload '[{"product_id":2,"quantity":1,"unit_price":1980},{"product_id":1,"quantity":2,"unit_price":5500}]' 12980)"
 check "HTTP 409" "$STATUS" 409
 check "short product is #1" "$(jq -r '.error.details.items[0].product_id' <<<"$BODY")" 1
 check "product 2 not reserved (still 17)" "$(stock_of 2)" 17
 
-set_product 1 5500 10 >/dev/null; set_product 2 1980 100 >/dev/null
+title "13b. one item short -> nothing is reserved (all-or-nothing, DB transaction rolled back)"
+set_product 101 300 1 >/dev/null
+submit "$(payload '[{"product_id":2,"quantity":1,"unit_price":1980},{"product_id":101,"quantity":2,"unit_price":300}]' 2580)"
+check "HTTP 409" "$STATUS" 409
+check "short product is #101" "$(jq -r '.error.details.items[0].product_id' <<<"$BODY")" 101
+check "product 2 not reserved (still 17)" "$(stock_of 2)" 17
+
+title "14. admin rejects invalid stock"
+call PUT /api/admin/products/2 '{"stock":-1}'
+check "negative stock rejected" "$STATUS" 400
+
+set_product 1 5500 10 >/dev/null; set_product 2 1980 100 >/dev/null; set_product 101 300 50 >/dev/null
 printf '\n\033[1mResult: %d passed, %d failed\033[0m\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

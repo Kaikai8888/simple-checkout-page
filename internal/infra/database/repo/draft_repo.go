@@ -1,10 +1,12 @@
 package repo
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -24,28 +26,89 @@ func NewDraftRepo(pool *pgxpool.Pool) *DraftRepo {
 	return &DraftRepo{pool: pool}
 }
 
-// Create inserts a pending draft. If the idempotency key was already used, the existing draft id is returned.
-func (r *DraftRepo) Create(ctx context.Context, id, idempotencyKey string, req model.CheckoutRequest) (draftID string, created bool, err error) {
+// StockLine is a quantity of one product moved in or out of a reservation.
+type StockLine struct {
+	ProductID int64
+	Quantity  int
+	FlashSale bool
+}
+
+const (
+	reservationHeld      = "held"
+	reservationCommitted = "committed"
+	reservationReleased  = "released"
+)
+
+// CreateWithReservation inserts a pending draft and reserves available_stock for every item in ONE transaction:
+// either the draft exists and all its units are held, or nothing happened.
+// If the idempotency key was already used, the existing draft id is returned with created = false.
+func (r *DraftRepo) CreateWithReservation(ctx context.Context, id, idempotencyKey string, req model.CheckoutRequest) (draftID string, created bool, err error) {
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return "", false, fmt.Errorf("marshal draft payload: %w", err)
 	}
-	err = r.pool.QueryRow(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return "", false, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	err = tx.QueryRow(ctx, `
 		INSERT INTO checkout_drafts (id, idempotency_key, payload, status)
 		VALUES ($1, $2, $3, $4)
 		ON CONFLICT (idempotency_key) DO NOTHING
 		RETURNING id`, id, idempotencyKey, payload, def.DraftStatusPending).Scan(&draftID)
-	if err == nil {
-		return draftID, true, nil
+	if errors.Is(err, pgx.ErrNoRows) {
+		// concurrent request with the same key won the race
+		if err := r.pool.QueryRow(ctx, "SELECT id FROM checkout_drafts WHERE idempotency_key = $1", idempotencyKey).Scan(&draftID); err != nil {
+			return "", false, fmt.Errorf("get draft by idempotency key: %w", err)
+		}
+		return draftID, false, nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if err != nil {
 		return "", false, fmt.Errorf("insert draft: %w", err)
 	}
-	err = r.pool.QueryRow(ctx, "SELECT id FROM checkout_drafts WHERE idempotency_key = $1", idempotencyKey).Scan(&draftID)
-	if err != nil {
-		return "", false, fmt.Errorf("get draft by idempotency key: %w", err)
+
+	// Lock rows in product-id order so concurrent checkouts with overlapping carts cannot deadlock.
+	items := slices.Clone(req.Items)
+	slices.SortFunc(items, func(a, b model.CheckoutItem) int { return cmp.Compare(a.ProductID, b.ProductID) })
+	for _, it := range items {
+		tag, err := tx.Exec(ctx, `
+			UPDATE products SET available_stock = available_stock - $2, updated_at = now()
+			 WHERE id = $1 AND available_stock >= $2`, it.ProductID, it.Quantity)
+		if err != nil {
+			return "", false, fmt.Errorf("reserve stock: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return "", false, r.shortageError(ctx, it)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO inventory_reservations (draft_id, product_id, quantity, status) VALUES ($1, $2, $3, $4)`,
+			id, it.ProductID, it.Quantity, reservationHeld); err != nil {
+			return "", false, fmt.Errorf("insert reservation: %w", err)
+		}
 	}
-	return draftID, false, nil
+	if err := tx.Commit(ctx); err != nil {
+		return "", false, fmt.Errorf("commit draft: %w", err)
+	}
+	return draftID, true, nil
+}
+
+func (r *DraftRepo) shortageError(ctx context.Context, it model.CheckoutItem) error {
+	issue := model.ItemIssue{ProductID: it.ProductID, RequestedQty: it.Quantity, ExpectedPrice: it.UnitPrice}
+	err := r.pool.QueryRow(ctx, "SELECT name, price, available_stock FROM products WHERE id = $1", it.ProductID).
+		Scan(&issue.Name, &issue.CurrentPrice, &issue.AvailableStock)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		issue.Reason = model.ItemIssueNotFound
+	case err != nil:
+		return fmt.Errorf("read product for shortage: %w", err)
+	case issue.AvailableStock <= 0:
+		issue.Reason = model.ItemIssueSoldOut
+	default:
+		issue.Reason = model.ItemIssueInsufficientStock
+	}
+	return def.NewError(def.ErrItemsChanged, "商品庫存不足，請確認後重新送出").WithDetails(map[string]any{"items": []model.ItemIssue{issue}})
 }
 
 // GetByIdempotencyKey returns nil when the key has not been used.
@@ -79,17 +142,60 @@ func (r *DraftRepo) Claim(ctx context.Context, id string) (*model.CheckoutDraft,
 	return d, err
 }
 
-func (r *DraftRepo) MarkFailed(ctx context.Context, id string, appErr *def.AppError) error {
+// ReleaseAndFail gives the held units back to available_stock and marks the draft failed, in one transaction.
+// Idempotent: a second call finds no held reservation and changes nothing. Returns the released lines.
+func (r *DraftRepo) ReleaseAndFail(ctx context.Context, id string, appErr *def.AppError) ([]StockLine, error) {
 	details, err := json.Marshal(appErr.Details)
 	if err != nil {
-		return fmt.Errorf("marshal error details: %w", err)
+		return nil, fmt.Errorf("marshal error details: %w", err)
 	}
-	_, err = r.pool.Exec(ctx, `
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	rows, err := tx.Query(ctx, `
+		UPDATE inventory_reservations r SET status = $2, updated_at = now()
+		  FROM products p
+		 WHERE r.draft_id = $1 AND r.status = $3 AND p.id = r.product_id
+		RETURNING r.product_id, r.quantity, p.flash_sale`, id, reservationReleased, reservationHeld)
+	if err != nil {
+		return nil, fmt.Errorf("release reservations: %w", err)
+	}
+	var lines []StockLine
+	for rows.Next() {
+		var l StockLine
+		if err := rows.Scan(&l.ProductID, &l.Quantity, &l.FlashSale); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		lines = append(lines, l)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	slices.SortFunc(lines, func(a, b StockLine) int { return cmp.Compare(a.ProductID, b.ProductID) })
+	for _, l := range lines {
+		if _, err := tx.Exec(ctx, `
+			UPDATE products SET available_stock = available_stock + $2, updated_at = now() WHERE id = $1`,
+			l.ProductID, l.Quantity); err != nil {
+			return nil, fmt.Errorf("restore available stock: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `
 		UPDATE checkout_drafts
 		   SET status = $2, error_code = $3, error_message = $4, error_details = $5, updated_at = now()
 		 WHERE id = $1 AND status IN ($6, $7)`,
-		id, def.DraftStatusFailed, string(appErr.Code), appErr.Message, details, def.DraftStatusPending, def.DraftStatusProcessing)
-	return err
+		id, def.DraftStatusFailed, string(appErr.Code), appErr.Message, details, def.DraftStatusPending, def.DraftStatusProcessing); err != nil {
+		return nil, fmt.Errorf("mark draft failed: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit release: %w", err)
+	}
+	return lines, nil
 }
 
 // Release puts a draft back to pending so it can be retried after a transient error.
@@ -138,29 +244,4 @@ func scanDraft(row pgx.Row) (*model.CheckoutDraft, error) {
 	}
 	d.ErrorDetails = details
 	return &d, nil
-}
-
-// OutstandingReserved sums quantities of drafts that still hold a Valkey stock reservation
-// (pending / processing). Used to rebuild the Valkey stock counter: available = DB stock - outstanding.
-// excludeDraftID skips a draft that has been inserted but has not reserved yet.
-func (r *DraftRepo) OutstandingReserved(ctx context.Context, productIDs []int64, excludeDraftID string) (map[int64]int, error) {
-	rows, err := r.pool.Query(ctx, `
-		SELECT (item->>'product_id')::bigint AS product_id, SUM((item->>'quantity')::int)::int
-		  FROM checkout_drafts d, jsonb_array_elements(d.payload->'items') item
-		 WHERE d.status IN ($1, $2) AND (item->>'product_id')::bigint = ANY($3) AND d.id <> $4
-		 GROUP BY 1`, def.DraftStatusPending, def.DraftStatusProcessing, productIDs, excludeDraftID)
-	if err != nil {
-		return nil, fmt.Errorf("sum outstanding reservations: %w", err)
-	}
-	defer rows.Close()
-	result := map[int64]int{}
-	for rows.Next() {
-		var id int64
-		var qty int
-		if err := rows.Scan(&id, &qty); err != nil {
-			return nil, err
-		}
-		result[id] = qty
-	}
-	return result, rows.Err()
 }

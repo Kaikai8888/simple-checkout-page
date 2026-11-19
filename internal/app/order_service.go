@@ -48,7 +48,7 @@ func (s *OrderService) ExpireOverdue(ctx context.Context) error {
 	}
 	if len(ids) > 0 {
 		slog.InfoContext(ctx, "expired unpaid orders", "order_ids", ids)
-		s.products.Restock(ctx, restocked)
+		s.products.ReturnLinesToGate(ctx, restocked)
 	}
 	return nil
 }
