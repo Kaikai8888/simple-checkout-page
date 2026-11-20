@@ -20,10 +20,13 @@ import (
 )
 
 const (
-	maxDraftAttempts     = 3
-	stalePendingAfter    = 10 * time.Second
-	staleProcessingAfter = 60 * time.Second
-	reclaimBatchSize     = 100
+	maxDraftAttempts = 3
+	publishGrace     = 5 * time.Second  // Submit's own publish; after this the reclaim job publishes unpublished drafts
+	retryBaseDelay   = 2 * time.Second  // backoff after a transient error: 2s, 4s, ...
+	processTimeout   = 30 * time.Second // one ProcessDraft run
+	cleanupTimeout   = 5 * time.Second  // fail / release after processTimeout
+	processingLease  = 60 * time.Second // processing longer than this = worker died; must exceed processTimeout + cleanupTimeout
+	reclaimBatchSize = 100
 )
 
 type CheckoutService struct {
@@ -76,7 +79,7 @@ func (s *CheckoutService) Submit(ctx context.Context, user model.User, idempoten
 		return adapter.SubmitCheckoutOutput{}, err // sold out at the gate: the DB was never touched
 	}
 
-	draftID, created, err := s.drafts.CreateWithReservation(ctx, uuid.NewString(), user.ID, idempotencyKey, req)
+	draftID, created, err := s.drafts.CreateWithReservation(ctx, uuid.NewString(), user.ID, idempotencyKey, req, publishGrace)
 	if err != nil || !created {
 		s.products.ReturnToGate(ctx, taken) // DB said no (or duplicate request): give the gate units back
 	}
@@ -88,8 +91,11 @@ func (s *CheckoutService) Submit(ctx context.Context, user model.User, idempoten
 	}
 
 	if err := s.producer.PublishCheckoutRequested(ctx, draftID); err != nil {
-		// Not fatal: the draft is persisted, the reclaim job will publish it again.
+		// Not fatal: the draft is persisted and unpublished, the reclaim job publishes it after publishGrace.
 		slog.ErrorContext(ctx, "publish checkout requested failed, will be reclaimed", "draft_id", draftID, "err", err)
+	} else if err := s.drafts.MarkPublished(ctx, draftID); err != nil {
+		// Worst case the reclaim job publishes a duplicate, which Claim ignores.
+		slog.WarnContext(ctx, "mark draft published failed", "draft_id", draftID, "err", err)
 	}
 	return adapter.SubmitCheckoutOutput{DraftID: draftID, Status: def.DraftStatusPending}, nil
 }
@@ -117,13 +123,26 @@ func (s *CheckoutService) GetStatus(ctx context.Context, user model.User, draftI
 }
 
 // ProcessDraft is called by the Kafka consumer. Safe to call multiple times for the same draft.
-func (s *CheckoutService) ProcessDraft(ctx context.Context, draftID string) error {
+//
+// A run is capped by processTimeout so a slow worker never outlives processingLease; otherwise the reclaim job
+// would hand the same draft to a second worker while the first one is still working on it.
+func (s *CheckoutService) ProcessDraft(parent context.Context, draftID string) error {
+	ctx, cancel := context.WithTimeout(parent, processTimeout)
+	defer cancel()
+	// fail / release must still run when the processing context has timed out.
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(parent), processTimeout+cleanupTimeout)
+	defer cancelCleanup()
+
 	draft, err := s.drafts.Claim(ctx, draftID)
 	if err != nil {
 		return fmt.Errorf("claim draft: %w", err)
 	}
 	if draft == nil {
 		return nil // already handled by someone else (duplicated message)
+	}
+	// Claim counts attempts, so this catches drafts that keep killing the worker (processing lease expired again and again).
+	if draft.Attempts > maxDraftAttempts {
+		return s.fail(cleanupCtx, draft, def.NewError(def.ErrInternal, "訂單建立失敗，請稍後再試"))
 	}
 
 	now := s.now()
@@ -146,27 +165,38 @@ func (s *CheckoutService) ProcessDraft(ctx context.Context, draftID string) erro
 	}
 
 	if appErr, ok := def.AsAppError(err); ok {
-		return s.fail(ctx, draft, appErr)
+		return s.fail(cleanupCtx, draft, appErr)
 	}
 	if draft.Attempts >= maxDraftAttempts {
-		_ = s.fail(ctx, draft, def.NewError(def.ErrInternal, "訂單建立失敗，請稍後再試"))
+		_ = s.fail(cleanupCtx, draft, def.NewError(def.ErrInternal, "訂單建立失敗，請稍後再試"))
 		return err
 	}
-	// transient error: back to pending, the reclaim job will publish it again
-	if relErr := s.drafts.Release(ctx, draft.ID); relErr != nil {
+	// Transient error: back to pending with a backoff; the reclaim job publishes a new message when it is due.
+	// If Release itself fails the draft stays processing and is recovered after processingLease.
+	if relErr := s.drafts.Release(cleanupCtx, draft.ID, retryDelay(draft.Attempts)); relErr != nil {
 		slog.ErrorContext(ctx, "release draft failed", "draft_id", draft.ID, "err", relErr)
 	}
 	return err
 }
 
-// ReclaimStale re-publishes drafts whose message was lost or whose worker died.
+// retryDelay is the backoff before the next attempt: retryBaseDelay * 2^(attempts-1).
+func retryDelay(attempts int) time.Duration {
+	return retryBaseDelay << max(attempts-1, 0)
+}
+
+// ReclaimStale publishes drafts that have no message in Kafka: Submit's publish failed, a retry's backoff is
+// over, or their worker died. Drafts that are published and only waiting in the queue are never re-published.
 func (s *CheckoutService) ReclaimStale(ctx context.Context) error {
-	ids, err := s.drafts.ReclaimStale(ctx, stalePendingAfter, staleProcessingAfter, reclaimBatchSize)
-	if err != nil || len(ids) == 0 {
-		return err
+	n, err := s.drafts.ReclaimStale(ctx, processingLease, reclaimBatchSize, func(ids []string) error {
+		if err := s.producer.PublishCheckoutRequested(ctx, ids...); err != nil {
+			return fmt.Errorf("publish drafts: %w", err)
+		}
+		return nil
+	})
+	if n > 0 {
+		slog.InfoContext(ctx, "published unpublished drafts", "count", n)
 	}
-	slog.InfoContext(ctx, "re-publishing stale drafts", "count", len(ids))
-	return s.producer.PublishCheckoutRequested(ctx, ids...)
+	return err
 }
 
 func (s *CheckoutService) Options() adapter.CheckoutOptionsOutput {

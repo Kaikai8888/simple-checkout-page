@@ -16,9 +16,9 @@ make reset       # wipe data; DB is re-seeded on next start
 
 To run the Go app on the host instead: `make infra`, then `make run`. The flash-sale gate sync is a separate one-shot command: `make gatesync` (in compose it runs as the `gate-sync` service every 30s).
 
-> **Upgrading from an older checkout:** the schema changed (accounts, draft ownership). The schema only runs on a fresh volume, so run `make reset` once before `make up`.
+> **Upgrading from an older checkout:** the schema changed (accounts, draft ownership, draft `published_at` / `next_retry_at`). The schema only runs on a fresh volume, so run `make reset` once before `make up`.
 
-**Tests:** `make test` runs the unit tests. `scripts/smoke-test.sh` runs the end-to-end scenarios below against a running stack (needs `curl` and `jq`), including login, ownership and admin checks.
+**Tests:** `make test` runs the unit tests. `scripts/smoke-test.sh` runs the end-to-end scenarios below against a running stack (needs `curl` and `jq`), including login, ownership and admin checks. `scripts/resilience-test.sh` (~2-3 min, needs `docker compose` too) injects failures to check the flash-gate init / gate-sync and the draft publish / retry flow: missing gates, gate drift, consumer lag, retry backoff, Kafka down at submit, and a worker that died mid-processing.
 
 **Inspecting data with a GUI** (TablePlus, DBeaver, Postico, pgAdmin, DataGrip, ...):
 
@@ -170,7 +170,7 @@ sequenceDiagram
 
 ### Status machines
 
-- **Draft:** `pending → processing → completed | failed`. Transient errors put it back to `pending`; a job re-publishes it.
+- **Draft:** `pending → processing → completed | failed`. Transient errors put it back to `pending` with a backoff (`next_retry_at`); the reclaim job publishes a new message when it is due.
 - **Order:** `pending_payment → paid | expired`. `refund_required` means the payment arrived after the order had expired.
 - **Payment:** one order can have several attempts, each `pending → succeeded | failed | expired`.
 
@@ -187,8 +187,11 @@ The client sends the unit price it displayed and the `expected_total` the shoppe
 - Duplicate messages are harmless:
   - the worker claims a draft with `UPDATE … WHERE status='pending'`;
   - `orders.draft_id` is `UNIQUE`.
-- A failing draft never blocks a partition. It is put back to `pending`, the offset is committed, and the reclaim job re-publishes it.
-- The **draft row in Postgres is the source of truth.** If a publish fails or a worker dies, the reclaim job re-publishes drafts that are `pending` for more than 10s or `processing` for more than 60s.
+- A failing draft never blocks a partition. On a transient error it is put back to `pending`, unpublished, with `next_retry_at` = now + backoff (2s, 4s; failed after 3 attempts). The old offset is committed, and the reclaim job publishes a **new** message once the backoff is over.
+- The **draft row in Postgres is the source of truth**, and it records whether its message is in Kafka (`published_at`). Kafka does not lose acknowledged messages (`acks=all`), so a draft only lacks a message when a publish failed, never because the queue is slow:
+  - `Submit` publishes right away and sets `published_at`. If that fails, the reclaim job publishes it after a 5s grace period.
+  - The reclaim job (every 5s) only publishes drafts that are `pending`, unpublished, and due. A **published draft that is still pending is just waiting in the queue** and is never re-published, however large the consumer lag. Rows are locked, published and marked in one transaction, so a failed publish marks nothing.
+  - **Worker died:** Kafka redelivers its message, but `Claim` rejects it because the draft is still `processing`. So a draft `processing` for more than 60s (the lease) goes back to `pending` and is published again. Each run is capped at 30s, so a slow but live worker never outlives its lease. A draft claimed more than 3 times (it keeps killing the worker) is failed.
 
 ### 3. Stock reservation: PostgreSQL for everything, a Valkey gate for flash sales
 Kafka only orders messages within a partition, and with several consumers the completion order is not the submit order anyway; a single partition would kill parallelism. So "who gets the last unit" is decided **synchronously at submit time**, not by the queue.

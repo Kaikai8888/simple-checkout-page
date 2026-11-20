@@ -50,6 +50,12 @@ CREATE TABLE checkout_drafts (
     payload         JSONB       NOT NULL,
     status          TEXT        NOT NULL, -- pending / processing / completed / failed
     attempts        INT         NOT NULL DEFAULT 0,
+    -- published_at:  checkout.requested for the current attempt is in Kafka. NULL = the reclaim job must (re)publish it.
+    -- next_retry_at: earliest time the reclaim job may publish an unpublished pending draft
+    --                (submit grace period, or retry backoff after a transient error).
+    -- A published draft that is still pending is just waiting in the queue (consumer lag) and is never re-published.
+    published_at    TIMESTAMPTZ,
+    next_retry_at   TIMESTAMPTZ,
     error_code      TEXT,
     error_message   TEXT,
     error_details   JSONB,
@@ -59,6 +65,7 @@ CREATE TABLE checkout_drafts (
     UNIQUE (customer_id, idempotency_key) -- keys are scoped per account: guessing someone else's key reveals nothing
 );
 CREATE INDEX idx_checkout_drafts_status_updated ON checkout_drafts (status, updated_at);
+CREATE INDEX idx_checkout_drafts_unpublished ON checkout_drafts (next_retry_at) WHERE status = 'pending' AND published_at IS NULL;
 
 -- Stock held by a checkout draft. held -> committed (order created) | released (checkout failed)
 CREATE TABLE inventory_reservations (

@@ -70,7 +70,8 @@ func (c *CheckoutConsumer) runMember(ctx context.Context, member int) {
 		if err := json.Unmarshal(msg.Value, &ev); err != nil || ev.DraftID == "" {
 			slog.Error("drop malformed message", "partition", msg.Partition, "offset", msg.Offset)
 		} else if err := c.svc.ProcessDraft(ctx, ev.DraftID); err != nil {
-			// We still commit: the draft was released back to pending and the reclaim job re-publishes it.
+			// We still commit (this is how the old message is dropped): on a transient error the draft was released
+			// back to pending with a backoff, and the reclaim job publishes a new message when it is due.
 			// This keeps one bad draft from blocking the whole partition.
 			slog.Error("process draft failed", "draft_id", ev.DraftID, "partition", msg.Partition, "err", err)
 		}

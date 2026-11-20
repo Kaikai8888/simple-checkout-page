@@ -42,7 +42,11 @@ const (
 // CreateWithReservation inserts a pending draft and reserves available_stock for every item in ONE transaction:
 // either the draft exists and all its units are held, or nothing happened.
 // If this customer already used the idempotency key, the existing draft id is returned with created = false.
-func (r *DraftRepo) CreateWithReservation(ctx context.Context, id string, customerID int64, idempotencyKey string, req model.CheckoutRequest) (draftID string, created bool, err error) {
+//
+// The draft starts unpublished with next_retry_at = now + publishGrace: the caller publishes it right away, and
+// only if that fails does the reclaim job publish it once the grace period is over.
+func (r *DraftRepo) CreateWithReservation(ctx context.Context, id string, customerID int64, idempotencyKey string,
+	req model.CheckoutRequest, publishGrace time.Duration) (draftID string, created bool, err error) {
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return "", false, fmt.Errorf("marshal draft payload: %w", err)
@@ -54,10 +58,10 @@ func (r *DraftRepo) CreateWithReservation(ctx context.Context, id string, custom
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	err = tx.QueryRow(ctx, `
-		INSERT INTO checkout_drafts (id, customer_id, idempotency_key, payload, status)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO checkout_drafts (id, customer_id, idempotency_key, payload, status, next_retry_at)
+		VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))
 		ON CONFLICT (customer_id, idempotency_key) DO NOTHING
-		RETURNING id`, id, customerID, idempotencyKey, payload, def.DraftStatusPending).Scan(&draftID)
+		RETURNING id`, id, customerID, idempotencyKey, payload, def.DraftStatusPending, publishGrace.Seconds()).Scan(&draftID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		// concurrent request from the same customer with the same key won the race
 		if err := r.pool.QueryRow(ctx, "SELECT id FROM checkout_drafts WHERE customer_id = $1 AND idempotency_key = $2",
@@ -200,37 +204,76 @@ func (r *DraftRepo) ReleaseAndFail(ctx context.Context, id string, appErr *def.A
 	return lines, nil
 }
 
-// Release puts a draft back to pending so it can be retried after a transient error.
-func (r *DraftRepo) Release(ctx context.Context, id string) error {
+// MarkPublished records that Submit's message reached Kafka, so the reclaim job will not publish it again.
+// attempts = 0 means no worker has claimed it yet; once a worker has, the draft's publish state belongs to
+// the retry flow (Release), and a late MarkPublished must not hide a pending retry.
+func (r *DraftRepo) MarkPublished(ctx context.Context, id string) error {
 	_, err := r.pool.Exec(ctx, `
-		UPDATE checkout_drafts SET status = $2, updated_at = now()
-		 WHERE id = $1 AND status = $3`, id, def.DraftStatusPending, def.DraftStatusProcessing)
+		UPDATE checkout_drafts SET published_at = now()
+		 WHERE id = $1 AND status = $2 AND attempts = 0 AND published_at IS NULL`, id, def.DraftStatusPending)
 	return err
 }
 
-// ReclaimStale recovers drafts whose queue message may have been lost (pending too long)
-// or whose worker crashed (processing too long). Returned ids should be re-enqueued.
-func (r *DraftRepo) ReclaimStale(ctx context.Context, pendingAfter, processingAfter time.Duration, limit int) ([]string, error) {
+// Release puts a draft back to pending after a transient error. It is left unpublished with a backoff, so the
+// reclaim job publishes a new message once next_retry_at is due; the consumer commits the old one.
+func (r *DraftRepo) Release(ctx context.Context, id string, retryAfter time.Duration) error {
 	_, err := r.pool.Exec(ctx, `
-		UPDATE checkout_drafts SET status = $1, updated_at = now() - make_interval(secs => $3)
-		 WHERE status = $2 AND updated_at < now() - make_interval(secs => $4)`,
-		def.DraftStatusPending, def.DraftStatusProcessing, pendingAfter.Seconds(), processingAfter.Seconds())
-	if err != nil {
-		return nil, fmt.Errorf("reset stuck drafts: %w", err)
+		UPDATE checkout_drafts
+		   SET status = $2, published_at = NULL, next_retry_at = now() + make_interval(secs => $4), updated_at = now()
+		 WHERE id = $1 AND status = $3`, id, def.DraftStatusPending, def.DraftStatusProcessing, retryAfter.Seconds())
+	return err
+}
+
+// ReclaimStale publishes every draft that has no message in Kafka, and returns how many it published.
+//
+//  1. processing longer than processingLease: the worker died (Kafka redelivers its message, but Claim rejects it
+//     because the draft is still processing), so the draft goes back to pending, due now.
+//  2. pending, unpublished and next_retry_at is due: Submit's publish failed, or a retry's backoff is over.
+//     These rows are locked (SKIP LOCKED, so parallel runs split the work), handed to publish, and marked
+//     published in the same transaction. If publish fails nothing is marked and the next run tries again; if the
+//     commit fails after publishing, the next run publishes a duplicate, which Claim ignores.
+//
+// A pending draft that is already published is only waiting in the queue, however long that takes.
+func (r *DraftRepo) ReclaimStale(ctx context.Context, processingLease time.Duration, limit int,
+	publish func(ids []string) error) (int, error) {
+
+	if _, err := r.pool.Exec(ctx, `
+		UPDATE checkout_drafts
+		   SET status = $1, published_at = NULL, next_retry_at = now(), updated_at = now()
+		 WHERE status = $2 AND updated_at < now() - make_interval(secs => $3)`,
+		def.DraftStatusPending, def.DraftStatusProcessing, processingLease.Seconds()); err != nil {
+		return 0, fmt.Errorf("reset stuck drafts: %w", err)
 	}
 
-	rows, err := r.pool.Query(ctx, `
-		UPDATE checkout_drafts SET updated_at = now()
-		 WHERE id IN (
-			SELECT id FROM checkout_drafts
-			 WHERE status = $1 AND updated_at < now() - make_interval(secs => $2)
-			 ORDER BY updated_at LIMIT $3
-			 FOR UPDATE SKIP LOCKED)
-		RETURNING id`, def.DraftStatusPending, pendingAfter.Seconds(), limit)
+	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("reclaim pending drafts: %w", err)
+		return 0, fmt.Errorf("begin tx: %w", err)
 	}
-	return pgx.CollectRows(rows, pgx.RowTo[string])
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	rows, err := tx.Query(ctx, `
+		SELECT id FROM checkout_drafts
+		 WHERE status = $1 AND published_at IS NULL AND next_retry_at <= now()
+		 ORDER BY next_retry_at LIMIT $2
+		 FOR UPDATE SKIP LOCKED`, def.DraftStatusPending, limit)
+	if err != nil {
+		return 0, fmt.Errorf("select drafts to publish: %w", err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil || len(ids) == 0 {
+		return 0, err
+	}
+	if err := publish(ids); err != nil {
+		return 0, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE checkout_drafts SET published_at = now(), updated_at = now() WHERE id = ANY($1)`, ids); err != nil {
+		return 0, fmt.Errorf("mark drafts published: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit published drafts: %w", err)
+	}
+	return len(ids), nil
 }
 
 func scanDraft(row pgx.Row) (*model.CheckoutDraft, error) {
