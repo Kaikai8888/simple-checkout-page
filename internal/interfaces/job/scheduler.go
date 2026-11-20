@@ -11,22 +11,20 @@ import (
 type Scheduler struct {
 	checkout *app.CheckoutService
 	orders   *app.OrderService
-	products *app.ProductService
 }
 
-func NewScheduler(checkout *app.CheckoutService, orders *app.OrderService, products *app.ProductService) *Scheduler {
-	return &Scheduler{checkout: checkout, orders: orders, products: products}
+func NewScheduler(checkout *app.CheckoutService, orders *app.OrderService) *Scheduler {
+	return &Scheduler{checkout: checkout, orders: orders}
 }
 
 // Run blocks until ctx is cancelled.
 // In a multi-instance deployment these jobs are still safe (FOR UPDATE SKIP LOCKED), but would usually run as a k8s CronJob.
+// The flash-sale gate sync is not here: it runs as its own process (cmd/gatesync, see GateSyncJob).
 func (s *Scheduler) Run(ctx context.Context) {
 	reclaim := time.NewTicker(5 * time.Second)
 	expire := time.NewTicker(15 * time.Second)
-	gateSync := time.NewTicker(30 * time.Second)
 	defer reclaim.Stop()
 	defer expire.Stop()
-	defer gateSync.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -38,11 +36,6 @@ func (s *Scheduler) Run(ctx context.Context) {
 		case <-expire.C:
 			if err := s.orders.ExpireOverdue(ctx); err != nil {
 				slog.Error("expire overdue orders failed", "err", err)
-			}
-		case <-gateSync.C:
-			// realign Valkey flash-sale gates with available_stock (the source of truth)
-			if err := s.products.SyncFlashGates(ctx); err != nil {
-				slog.Error("sync flash sale gates failed", "err", err)
 			}
 		}
 	}

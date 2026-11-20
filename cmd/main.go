@@ -81,8 +81,9 @@ func run() error {
 	if err := authSvc.EnsureAdmin(ctx, cfg.AdminEmail, cfg.AdminPassword); err != nil {
 		return fmt.Errorf("ensure admin account: %w", err)
 	}
+	// Best effort: reads are cache-aside, so a cold cache only costs a few DB reads.
 	if err := productSvc.WarmUp(ctx); err != nil {
-		return fmt.Errorf("warm up product cache: %w", err)
+		slog.Warn("warm up product cache failed, continuing with a cold cache", "err", err)
 	}
 
 	// ---- interfaces ----
@@ -110,7 +111,7 @@ func run() error {
 	start("consumer", func() {
 		consumer.NewCheckoutConsumer(checkoutSvc, cfg.KafkaBrokers, cfg.KafkaTopic, cfg.KafkaGroupID, cfg.ConsumerCount).Run(ctx)
 	})
-	start("scheduler", func() { job.NewScheduler(checkoutSvc, orderSvc, productSvc).Run(ctx) })
+	start("scheduler", func() { job.NewScheduler(checkoutSvc, orderSvc).Run(ctx) })
 
 	slog.Info("checkout system is up", "shop", cfg.AppPublicUrl, "gateway", cfg.GatewayPublicUrl)
 	<-ctx.Done()

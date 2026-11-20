@@ -1,4 +1,4 @@
-.PHONY: up down reset logs infra run test
+.PHONY: up down reset logs infra run gatesync test
 
 up:      ## build & start everything (app + postgres + valkey + kafka)
 	docker compose up --build -d
@@ -19,6 +19,9 @@ infra:   ## only dependencies, then `make run` to run the Go app on the host
 
 run:
 	go run ./cmd
+
+gatesync: ## realign flash-sale gates with the DB once (on the host, run it from cron or by hand)
+	go run ./cmd/gatesync
 
 test:
 	go test ./...

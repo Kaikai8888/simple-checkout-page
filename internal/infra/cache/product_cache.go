@@ -15,8 +15,8 @@ import (
 
 const productTTL = 24 * time.Hour
 
-// ProductCache caches product info (name, price, ...). Stock shown to shoppers comes from StockStore instead,
-// because that counter already excludes units reserved by in-flight checkouts.
+// ProductCache caches product info (name, price, ...). The cached stock fields are not used: ProductService
+// overlays live stock from ProductRepo.GetStockLevels, because available_stock changes on every checkout.
 type ProductCache struct {
 	client *redis.Client
 }

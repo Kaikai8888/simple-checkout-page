@@ -14,7 +14,7 @@ make logs        # follow app logs
 make reset       # wipe data; DB is re-seeded on next start
 ```
 
-To run the Go app on the host instead: `make infra`, then `make run`.
+To run the Go app on the host instead: `make infra`, then `make run`. The flash-sale gate sync is a separate one-shot command: `make gatesync` (in compose it runs as the `gate-sync` service every 30s).
 
 > **Upgrading from an older checkout:** the schema changed (accounts, draft ownership). The schema only runs on a fresh volume, so run `make reset` once before `make up`.
 
@@ -65,8 +65,10 @@ flowchart LR
   subgraph app[Go process]
     API[HTTP API :8080] --> SVC[App services]
     C[Kafka consumer group<br/>3 members] --> SVC
-    J[Jobs: reclaim drafts,<br/>expire unpaid orders,<br/>sync flash gates] --> SVC
+    J[Jobs: reclaim drafts,<br/>expire unpaid orders] --> SVC
   end
+  GS[gate-sync cronjob<br/>cmd/gatesync] -- realign gates --> VK
+  GS -- read available_stock --> PG
 
   SVC -- source of truth --> PG[(PostgreSQL<br/>products + available_stock, reservations,<br/>coupons, customers, drafts, orders, payments)]
   SVC -- product cache +<br/>flash-sale gate --> VK[(Valkey)]
@@ -79,6 +81,7 @@ Code layout (layered: interfaces → app → domain, with infra behind it):
 
 ```
 cmd/main.go                      wiring, graceful shutdown
+cmd/gatesync/                    one-shot flash-sale gate sync (run by a cron runner)
 config/                          env config
 db/migrations/                   schema + seed (run by postgres initdb)
 internal/domain/{def,model}      error codes, statuses, pricing & validation (pure, unit tested)
@@ -209,7 +212,9 @@ Each product has two numbers:
 
 - Only about `available_stock` requests ever reach the DB; the rest get an instant "sold out".
 - The gate is a **load shedder, not the source of truth**. If it drifts (a crash between gate and DB, a Valkey restart), the worst case is rejecting a few shoppers early or letting a few extra requests through to the DB, which rejects them. It can never oversell.
-- A job realigns every gate with `available_stock` every 30s, and on startup. If Valkey is down, the gate fails open and the DB decides.
+- **Initialising a gate.** The app does not build gates at startup, so it never waits on (or fails because of) the gate sync. A missing gate is created on first use: the Take script reports **every** missing gate in the cart at once (after the first missing one it only scans for more missing ones), then the server reads their `available_stock` in one query, creates them with `SETNX`, and retries once.
+- **Realigning.** A standalone cronjob (`cmd/gatesync`, the `gate-sync` compose service, every 30s) sets every gate to `available_stock`. If Valkey is down, the gate fails open and the DB decides.
+- **Memory limit.** Valkey runs with `maxmemory 256mb` and `volatile-lru`: only keys with a TTL (product cache, sessions) can be evicted. Gates have no TTL, so they are never evicted; if memory is still full, gate writes fail and checkout falls back to the DB.
 
 Why not Valkey for everything? It would mean two sources of truth to reconcile on every path (crash windows, restarts, drift). That cost is only worth paying for the few hot products where row-lock contention is the real bottleneck.
 

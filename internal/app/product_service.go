@@ -112,13 +112,14 @@ func (s *ProductService) PassFlashGate(ctx context.Context, items []model.Checko
 			return gateItems, nil
 		case res.ShortProductID != 0:
 			return nil, shortageError(items, products[res.ShortProductID], res.ShortProductID, res.Available)
-		case res.MissingProductID != 0 && attempt == 0:
-			if err := s.initGate(ctx, res.MissingProductID); err != nil {
+		case len(res.MissingProductIDs) > 0 && attempt == 0:
+			// The script reports every missing gate at once, so one init round covers the whole cart.
+			if err := s.initGates(ctx, res.MissingProductIDs); err != nil {
 				return nil, err
 			}
 		}
 	}
-	return nil, nil // gate still missing: let the DB decide
+	return nil, nil // gates still missing (e.g. deleted meanwhile): let the DB decide
 }
 
 // ReturnToGate gives back units taken from the gate when the checkout did not reserve in the DB.
@@ -139,7 +140,7 @@ func (s *ProductService) ReturnLinesToGate(ctx context.Context, lines []repo.Sto
 	s.ReturnToGate(ctx, items)
 }
 
-// SyncFlashGates realigns every gate with the DB (source of truth). Run periodically and at startup.
+// SyncFlashGates realigns every gate with the DB (source of truth). Run by the standalone gate-sync job (cmd/gatesync).
 func (s *ProductService) SyncFlashGates(ctx context.Context) error {
 	products, err := s.repo.ListFlashSale(ctx)
 	if err != nil {
@@ -153,27 +154,27 @@ func (s *ProductService) SyncFlashGates(ctx context.Context) error {
 	return nil
 }
 
-// WarmUp loads every product into the cache and initialises the flash-sale gates.
+// WarmUp loads every product into the cache. Flash-sale gates are not touched here: missing gates are created
+// lazily on the first checkout (PassFlashGate) and realigned by the standalone gate-sync job.
 func (s *ProductService) WarmUp(ctx context.Context) error {
 	products, err := s.repo.List(ctx)
 	if err != nil {
 		return err
 	}
-	if err := s.cache.SetMany(ctx, products); err != nil {
-		return err
-	}
-	return s.SyncFlashGates(ctx)
+	return s.cache.SetMany(ctx, products)
 }
 
-func (s *ProductService) initGate(ctx context.Context, productID int64) error {
-	levels, err := s.repo.GetStockLevels(ctx, []int64{productID})
+// initGates creates the given gates from available_stock with one DB query and one Valkey round trip.
+func (s *ProductService) initGates(ctx context.Context, productIDs []int64) error {
+	levels, err := s.repo.GetStockLevels(ctx, productIDs)
 	if err != nil {
 		return err
 	}
-	if l, ok := levels[productID]; ok {
-		return s.gate.InitIfAbsent(ctx, productID, l.Available)
+	available := make(map[int64]int, len(levels))
+	for id, l := range levels {
+		available[id] = l.Available
 	}
-	return nil
+	return s.gate.InitManyIfAbsent(ctx, available)
 }
 
 func shortageError(items []model.CheckoutItem, p model.Product, productID int64, available int) error {
